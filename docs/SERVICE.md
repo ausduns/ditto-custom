@@ -143,7 +143,7 @@ List-then-read so a clone never floods the agent's context:
 | `SIGNUP_DIRECT_ENABLED` | api | `true` | keep direct `POST /v1/signup` enabled; set `false` when Resend verification is configured |
 | `RESEND_API_KEY` | api | — | enables verified-email signup request/verify endpoints |
 | `SIGNUP_FROM_EMAIL` | api | — | verified sender, e.g. `Ditto <hello@ditto.site>` |
-| `SIGNUP_VERIFY_URL` | api | — | landing-page URL that receives `?token=...`, e.g. `https://ditto.site/api-key` |
+| `SIGNUP_VERIFY_URL` | api | — | landing-page URL that receives `?token=...`, e.g. `https://www.ditto.site/api-key` |
 | `SIGNUP_TOKEN_TTL_MINUTES` | api | `30` | one-time email verification token lifetime |
 | `SIGNUP_CORS_ORIGINS` | api | `https://ditto.site,https://www.ditto.site` | comma-separated browser origins allowed to call public signup routes |
 | `SSRF_DISABLE` | api | `false` | turn off the SSRF guard (not recommended) |

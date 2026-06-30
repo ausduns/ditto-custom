@@ -20,7 +20,7 @@ frozen capture in, byte-stable app out.
 - REST API: `https://api.ditto.site`
 - MCP server: `https://api.ditto.site/mcp`
 
-Get a hosted key at `https://ditto.site/api-key`, or call the verified-email
+Get a hosted key at `https://www.ditto.site/api-key`, or call the verified-email
 signup flow directly:
 
 ```bash
