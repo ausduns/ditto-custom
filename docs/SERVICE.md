@@ -145,7 +145,7 @@ List-then-read so a clone never floods the agent's context:
 | `SIGNUP_FROM_EMAIL` | api | — | verified sender, e.g. `Ditto <hello@ditto.site>` |
 | `SIGNUP_VERIFY_URL` | api | — | landing-page URL that receives `?token=...`, e.g. `https://ditto.site/api-key` |
 | `SIGNUP_TOKEN_TTL_MINUTES` | api | `30` | one-time email verification token lifetime |
-| `SIGNUP_CORS_ORIGINS` | api | `https://ditto.site` | comma-separated browser origins allowed to call public signup routes |
+| `SIGNUP_CORS_ORIGINS` | api | `https://ditto.site,https://www.ditto.site` | comma-separated browser origins allowed to call public signup routes |
 | `SSRF_DISABLE` | api | `false` | turn off the SSRF guard (not recommended) |
 | `SSRF_ALLOW_LOOPBACK` | api | `false` | allow cloning localhost (local dev) |
 | `S3_BUCKET` / `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` / `S3_PUBLIC_URL` | api, worker | — | set `S3_BUCKET` ⇒ object storage |

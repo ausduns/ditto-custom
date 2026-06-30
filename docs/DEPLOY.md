@@ -58,7 +58,7 @@ RESEND_API_KEY=re_...
 SIGNUP_FROM_EMAIL=Ditto <hello@ditto.site>   # must be a verified Resend sender/domain
 SIGNUP_VERIFY_URL=https://ditto.site/api-key
 SIGNUP_TOKEN_TTL_MINUTES=30
-SIGNUP_CORS_ORIGINS=https://ditto.site       # browser origins allowed to call signup routes
+SIGNUP_CORS_ORIGINS=https://ditto.site,https://www.ditto.site # browser origins allowed to call signup routes
 # SSRF is on by default; do NOT set SSRF_ALLOW_LOOPBACK in prod.
 ```
 

@@ -60,7 +60,7 @@ export function loadEnv(): ApiEnv {
     signupFromEmail: process.env.SIGNUP_FROM_EMAIL,
     signupVerifyUrl: process.env.SIGNUP_VERIFY_URL,
     signupTokenTtlMinutes: parseInt(process.env.SIGNUP_TOKEN_TTL_MINUTES ?? "30", 10),
-    signupCorsOrigins: (process.env.SIGNUP_CORS_ORIGINS ?? "https://ditto.site").split(",").map((s) => s.trim()).filter(Boolean),
+    signupCorsOrigins: (process.env.SIGNUP_CORS_ORIGINS ?? "https://ditto.site,https://www.ditto.site").split(",").map((s) => s.trim()).filter(Boolean),
     ssrfEnabled: process.env.SSRF_DISABLE !== "true",
     ssrfAllowLoopback: process.env.SSRF_ALLOW_LOOPBACK === "true",
   };
