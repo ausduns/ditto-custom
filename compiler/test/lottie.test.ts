@@ -62,6 +62,20 @@ describe("buildLottieSpec", () => {
     assert.equal(spec.items[0]!.renderer, "canvas");
   });
 
+  it("falls back to inline animationData when a source URL was detected but not downloaded", () => {
+    const ir = irWith(node("n0", {}, [node("n6", { "data-cid-cap": "cap-1" })]));
+    const motion = emptyMotion({
+      lotties: [lottie({ src: "https://x/missing.json", inlineKey: "k0" })],
+      lottieInline: { k0: { v: "5.7", layers: [] } },
+    });
+    const graph: AssetGraph = { entries: [], byUrl: new Map() };
+
+    const spec = buildLottieSpec(ir, motion, graph);
+    assert.equal(spec.items.length, 1);
+    assert.equal(spec.items[0]!.path, null);
+    assert.deepEqual(spec.items[0]!.animationData, { v: "5.7", layers: [] });
+  });
+
   it("drops a lottie whose container node didn't survive into the IR", () => {
     const ir = irWith(node("n0", {}, [node("n6", { "data-cid-cap": "other-cap" })]));
     const motion = emptyMotion({ lotties: [lottie({ src: "https://x/anim.json" })] });

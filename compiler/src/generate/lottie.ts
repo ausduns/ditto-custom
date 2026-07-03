@@ -108,7 +108,6 @@ export function lottieWireJsx(spec: LottieSpec, indent: number): string {
 
 export const DITTO_LOTTIE_TSX = `"use client";
 import { useEffect } from "react";
-import lottie from "lottie-web";
 
 type RTLottie = {
   cid: string;
@@ -127,28 +126,33 @@ const byCid = (cid: string): HTMLElement | null => document.querySelector('[data
 export default function DittoLottie({ spec }: { spec: LottieSpec }) {
   useEffect(() => {
     const stopped = (window as any).__dittoMotionStopped === true;
-    const anims: Array<ReturnType<typeof lottie.loadAnimation>> = [];
-    for (const it of spec.items) {
-      const el = byCid(it.cid);
-      if (!el) continue;
-      // clear the captured placeholder frame so it never stacks with the live render
-      el.innerHTML = "";
-      try {
-        const anim = lottie.loadAnimation({
-          container: el,
-          renderer: it.renderer === "canvas" ? "canvas" : "svg",
-          loop: it.loop,
-          autoplay: it.autoplay && !stopped,
-          ...(it.path ? { path: it.path } : { animationData: it.animationData as object }),
-          rendererSettings: { preserveAspectRatio: "xMidYMid meet" },
-        });
-        if (stopped) { try { anim.goToAndStop(0, true); } catch {} }
-        anims.push(anim);
-      } catch {
-        /* a single bad animation must not break the page */
+    const anims: Array<{ destroy: () => void; goToAndStop: (value: number, isFrame?: boolean) => void }> = [];
+    let cancelled = false;
+    void (async () => {
+      const lottie = (await import("lottie-web")).default;
+      if (cancelled) return;
+      for (const it of spec.items) {
+        const el = byCid(it.cid);
+        if (!el) continue;
+        // clear the captured placeholder frame so it never stacks with the live render
+        el.innerHTML = "";
+        try {
+          const anim = lottie.loadAnimation({
+            container: el,
+            renderer: it.renderer === "canvas" ? "canvas" : "svg",
+            loop: it.loop,
+            autoplay: it.autoplay && !stopped,
+            ...(it.path ? { path: it.path } : { animationData: it.animationData as object }),
+            rendererSettings: { preserveAspectRatio: "xMidYMid meet" },
+          });
+          if (stopped) { try { anim.goToAndStop(0, true); } catch {} }
+          anims.push(anim);
+        } catch {
+          /* a single bad animation must not break the page */
+        }
       }
-    }
-    return () => { for (const a of anims) { try { a.destroy(); } catch {} } };
+    })().catch(() => {});
+    return () => { cancelled = true; for (const a of anims) { try { a.destroy(); } catch {} } };
   }, [spec]);
   return null;
 }

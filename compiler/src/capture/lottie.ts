@@ -89,6 +89,13 @@ export async function captureLotties(
             if (!u || typeof u !== "string") return null;
             try { return new URL(u, document.baseURI).href; } catch { return null; }
           };
+          const registrySrc = (path: string, fileName: string): string | null => {
+            if (!path) return null;
+            if (/\.json(?:[?#]|$)/i.test(path)) return abs(path);
+            if (!fileName) return null;
+            const base = path.endsWith("/") ? path : path + "/";
+            return abs(base + (fileName.includes(".") ? fileName : fileName + ".json"));
+          };
           // climb to the nearest ancestor (or self) carrying a data-cid-cap
           const capOf = (node: Element | null): string | null => {
             let el: Element | null = node;
@@ -144,10 +151,12 @@ export async function captureLotties(
               // fall back to the in-memory animationData document.
               const path = (a.path as string) || "";
               const fileName = (a.fileName as string) || "";
-              let src: string | null = null;
-              if (path) src = abs(path.endsWith("/") || !fileName ? path + (fileName.endsWith(".json") ? fileName : "data.json") : path + (fileName ? (fileName.includes(".") ? fileName : fileName + ".json") : ""));
-              let inlineKey: string | null = null;
-              if (!src && a.animationData) inlineKey = stashInline(a.animationData);
+              const src = registrySrc(path, fileName);
+              // Keep in-memory data as a fallback even when the registry reports a URL:
+              // some sites expose only a directory-ish path, and guessed `data.json`
+              // URLs 404. Generation prefers a downloaded local path, then falls back
+              // to this JSON if the URL is absent or unreachable.
+              const inlineKey = a.animationData ? stashInline(a.animationData) : null;
               const rendererType = ((a.renderer as { rendererType?: string })?.rendererType)
                 || (a.renderer && a.renderer.constructor && a.renderer.constructor.name === "CanvasRenderer" ? "canvas" : undefined);
               push({ container, via: "registry", src, inlineKey, renderer: rendererType, loop: a.loop, autoplay: a.autoplay });
