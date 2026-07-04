@@ -482,8 +482,11 @@ export async function captureMotion(page: Page, opts?: { observeMs?: number; log
             const cap = el && (el as Element).getAttribute?.("data-cid-cap");
             if (!cap) continue;
             const elem = el as Element;
-            // only track small text-bearing elements (a rotating word/phrase, not a big block)
-            if (elem.querySelector("[data-cid-cap]")) continue; // has element children → not a leaf word
+            // only track small text-bearing elements (a rotating word/phrase, not a big block).
+            // Reject ANY element child, capped or not: rows injected at runtime (after cid-cap
+            // tagging, so uncapped) would otherwise defeat a capped-only check and let a
+            // multi-element panel pass as a "leaf word".
+            if (elem.firstElementChild) continue; // has element children → not a leaf word
             const txt = norm(elem.textContent || "");
             if (!txt || txt.length > 80) continue;
             const e = changes.get(cap) ?? { texts: [], times: [] };
