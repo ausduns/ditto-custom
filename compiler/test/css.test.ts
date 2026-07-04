@@ -388,6 +388,32 @@ describe("generateCss literal-margin vs auto-centring", () => {
     const all = allRulesX(css, "n1");
     assert.ok(/margin-left:auto/.test(all), `a constrained centred block should still auto-centre, got: ${all}`);
   });
+
+  // A centred `max-width` container whose cap is FLUID — `max-width: min(1272px, 100vw − 2·gutter)`
+  // resolves to a DIFFERENT px at every width (311/673/1145). The block is centred at every sample
+  // (symmetric positive gaps that scale with width). It must auto-centre (`mx-auto`) with per-band
+  // caps, NOT freeze to literal per-band `margin-left` (which pins it left at non-captured widths).
+  it("auto-centres a container with a per-viewport (fluid) max-width cap", () => {
+    // border-box block, max-width per vp, box width == cap, symmetric gaps everywhere.
+    const child = xNode("n1", "div", {
+      375: { cs: { display: "block", boxSizing: "border-box", maxWidth: "311px", marginLeft: "0px", marginRight: "0px", width: "311px" }, bbox: { x: 32, y: 0, width: 311, height: 200 } },
+      768: { cs: { display: "block", boxSizing: "border-box", maxWidth: "673.2px", marginLeft: "0px", marginRight: "0px", width: "673.2px" }, bbox: { x: 47.4, y: 0, width: 673.2, height: 200 } },
+      1280: { cs: { display: "block", boxSizing: "border-box", maxWidth: "1145.08px", marginLeft: "0px", marginRight: "0px", width: "1145.08px" }, bbox: { x: 67.46, y: 0, width: 1145.08, height: 200 } },
+    });
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 200 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 200 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 200 } },
+    }, [child]);
+    const css = generateCss(xIr(parent), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/margin-left:auto/.test(all), `fluid-cap centred container must auto-centre, got: ${all}`);
+    assert.ok(!/margin-left:0?67|margin-left:32px|margin-left:47/.test(all), `must NOT bake literal per-band left margins, got: ${all}`);
+    // The per-viewport caps survive as banded max-width (the canonical 1145.08 at base, others banded).
+    assert.ok(baseRule(css, "n1").includes("max-width:1145.08px"), `base carries the canonical cap, got: ${baseRule(css, "n1")}`);
+    const mobile = xBandRule(css, /^\(max-width/, "n1");
+    assert.ok(/max-width:311px/.test(mobile), `mobile band carries its own fluid cap, got: ${mobile}`);
+  });
 });
 
 // BUG C — a single-line text leaf whose unwrapped width nearly fills its column at every width gets

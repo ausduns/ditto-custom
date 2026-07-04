@@ -362,11 +362,17 @@ function planWidth(node: IRNode, parentNode: IRNode | undefined, viewports: numb
   // Replaced/custom elements size to intrinsic dimensions under auto/%, not the container.
   if (REPLACED.has(node.tag) || node.tag.includes("-")) return none;
 
-  type Sample = { w: number; bw: number; cw: number; ml: number; mr: number; maxW: number | null; gapL: number; gapR: number; borderBox: boolean };
+  type Sample = { w: number; bw: number; cw: number; ml: number; mr: number; maxW: number | null; gapL: number; gapR: number; borderBox: boolean; visible: boolean };
   const samples: Sample[] = [];
   for (const vp of viewports) {
     const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
     if (!cs || !nb) continue;
+    // A viewport where the node (or its containing block) is display:none / zero-box contributes no
+    // geometry: its computed box is 0×0, margins report the unresolved `auto`, and the containing width
+    // is 0. Skip it rather than bailing the whole inference — a container hidden at some breakpoints can
+    // still be provably centred at the widths where it IS painted (judged over the visible samples below).
+    const paintedHere = !!node.visibleByVp[vp] && nb.width > 0;
+    if (!paintedHere) continue;
     // Block-LEVEL, in-flow only: margin-auto centring and auto/100% fill apply to these; an
     // inline / inline-block / flex-item box is positioned differently, so bail conservatively.
     if (!/^(block|flow-root|list-item|flex|grid)$/.test(cs.display || "")) return none;
@@ -387,6 +393,7 @@ function planWidth(node: IRNode, parentNode: IRNode | undefined, viewports: numb
     samples.push({
       w, bw: nb.width, cw, ml: pf(cs.marginLeft), mr: pf(cs.marginRight), maxW,
       gapL: nb.x - cl, gapR: cr - (nb.x + nb.width), borderBox: (cs.boxSizing || "border-box") !== "content-box",
+      visible: !!node.visibleByVp[vp] && nb.width > 0,
     });
   }
   if (samples.length < 2) return none;
@@ -395,14 +402,26 @@ function planWidth(node: IRNode, parentNode: IRNode | undefined, viewports: numb
   const span = (xs: number[]): number => Math.max(...xs) - Math.min(...xs);
   const zeroMargins = samples.every((s) => Math.abs(s.ml) <= 1.5 && Math.abs(s.mr) <= 1.5);
 
-  // (a) Centred max-width container: border-box, a single px max-width cap, and every sample's
-  // border box equals min(containerWidth, cap) — filling when narrower than the cap, centred
-  // (symmetric positive gaps) when wider. Reproduces `max-width:W; margin:0 auto` exactly.
-  if (samples.every((s) => s.maxW != null && s.borderBox)) {
-    const caps = samples.map((s) => s.maxW!);
-    let ok = span(caps) <= Math.max(2, 0.01 * Math.max(...caps));
+  // (a) Centred max-width container: border-box, a px max-width cap AT EVERY sample, and every
+  // sample's border box equals min(containerWidth, cap) — filling when narrower than the cap, centred
+  // (symmetric positive gaps) when wider. Reproduces `margin:0 auto` centring with a per-viewport cap.
+  // The cap need NOT be a single constant: a fluid `max-width: min(Wpx, 100vw − 2·gutter)` resolves to
+  // a DIFFERENT px per width (e.g. 311/673/1145/1272), so requiring a constant cap wrongly rejected the
+  // commonest centred container and left it PLAN_FIXED with literal per-band `mx-*` (off-centre at any
+  // non-captured width). We accept per-viewport caps and let the normal per-band `max-width` emission
+  // carry them; `mx-auto` (from centerAlways) then centres at EVERY width. Fidelity is preserved
+  // because each sample's `min(cw, maxW_vp)` reproduces the captured box exactly at that width. The
+  // `sawCenter` requirement below is the load-bearing guard: a box that merely FILLS (never shows
+  // symmetric free-space gaps) is NOT proven centred and stays PLAN_FIXED with its literal margins.
+  // A display:none / zero-box sample has no geometry to prove centring against (its computed box is
+  // 0×0 and its margins report the unresolved `auto`). Judge case (a) only over the VISIBLE samples —
+  // a container centred wherever it is actually painted is centred everywhere via `mx-auto`, even if it
+  // is hidden at some breakpoints. (≥2 visible samples still required so the inference has evidence.)
+  const vis = samples.filter((s) => s.visible);
+  if (vis.length >= 2 && vis.every((s) => s.maxW != null && s.borderBox)) {
+    let ok = true;
     let sawCenter = false;
-    if (ok) for (const s of samples) {
+    for (const s of vis) {
       if (!close(s.bw, Math.min(s.cw, s.maxW!), 1.5, 0.01)) { ok = false; break; }
       if (s.cw > s.maxW! + 4) { // room to centre — must actually be centred, not left-aligned
         if (s.gapL > 1 && s.gapR > 1 && Math.abs(s.gapL - s.gapR) <= 1.5) sawCenter = true;

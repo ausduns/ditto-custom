@@ -5,7 +5,7 @@ import { join, extname, normalize } from "node:path";
 import { spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { collectPage, type PageSnapshot } from "../capture/walker.js";
-import { captureFullPageViaCDP } from "../capture/capture.js";
+import { captureFullPageViaCDP, normalizeVideoTime } from "../capture/capture.js";
 import { ensureDir, writeJSONCompact } from "../util/fsx.js";
 
 const ESBUILD_SHIM =
@@ -262,6 +262,11 @@ export async function renderApp(opts: {
         // matters less here, but symmetric capture is the requirement.
         try {
           const shotPath = join(opts.renderedDir, "screenshots", `${vw}.png`);
+          // Pin every clone-side <video> to frame 0 (paused) before the shot — the SOURCE channel is
+          // now normalized to frame 0 at every viewport too, so both sides show the same frame and a
+          // video's playback time can't manufacture a perceptual diff. (The static clone rarely plays,
+          // but a replayed/autoplaying video would otherwise drift; symmetric normalization is the rule.)
+          await normalizeVideoTime(page);
           try {
             await captureFullPageViaCDP(page, shotPath);
           } catch {

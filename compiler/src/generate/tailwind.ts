@@ -262,6 +262,13 @@ export function declToUtil(prop: string, value: string): string {
     if (value === "0" || value === "0px" || value === "0rem") {
       return ZERO_NAMED.has(prop) ? `${ARB[prop]}-0` : `${ARB[prop]}-[0px]`;
     }
+    // `snapLen`'s 0.1px integer snap is calibrated for BOX lengths (killing measurement jitter like
+    // `204.9994px`→`205px`). letter-spacing is authored at a far finer scale — a real `-0.08px`/
+    // `-0.0375px` tracking is WITHIN 0.1px of zero, so snapLen would collapse it to `0px`. Chromium
+    // then serializes computed `letter-spacing:0` as the keyword `normal`, which the style gate's
+    // numeric compare can't parse → a false exact-string mismatch. Skip the integer snap for tracking;
+    // `snapBase` rounds it to 2 decimals (`tracking-[-0.08px]`), the right precision for this axis.
+    if (prop === "letter-spacing") return `${ARB[prop]}-[${arb(value)}]`;
     return `${ARB[prop]}-[${arb(snapLen(value))}]`;
   }
   if (/^border-(top|right|bottom|left)-width$/.test(prop)) {
@@ -372,7 +379,7 @@ function parseSide(b: string): SidePart | null {
   for (const h of COLLAPSE_HEADS) if (body.startsWith(h + "-")) return { neg, head: h, suf: body.slice(h.length + 1) };
   return null;
 }
-function collapseBases(bases: string[]): string[] {
+export function collapseBases(bases: string[]): string[] {
   const byHead = new Map<string, SidePart>(); // head → its parsed part (sides are unique within a group)
   for (const b of bases) { const p = parseSide(b); if (p) byHead.set(p.head, p); }
   const origOf = new Map<string, string>(); // head → original base string (to drop/replace by identity)
@@ -429,6 +436,18 @@ function collapseBases(bases: string[]): string[] {
   if (wv !== null) { const sfx = wv ? `-${wv}` : ""; replace.set(`border-t${sfx}`, `border${sfx}`); for (const s of ["r", "b", "l"]) drop.add(`border-${s}${sfx}`); }
   const cv = allEqSide(bcSuf);
   if (cv !== null) { replace.set(`border-t-${cv}`, `border-${cv}`); for (const s of ["r", "b", "l"]) drop.add(`border-${s}-${cv}`); }
+  // flex:1 1 0% → the idiomatic `flex-1` (Tailwind `flex-1` compiles to `flex: 1 1 0%`, EXACTLY these
+  // longhands). Fold when this band sets flex-grow:1 (`grow-[1]`) AND a zero flex-basis (`basis-[0%]`,
+  // or its already-shortened `basis-0` — reached from a band delta). flex-shrink is the CSS default 1
+  // (elided) unless an explicit `shrink-0` is present, which would break the equivalence — so require
+  // its absence. Emitting `flex-1` rather than `grow basis-[0%]` also sidesteps the `basis-[0%]`→`basis
+  // -0` prettify hazard (0% content-sizes against an indefinite main axis; 0px is a definite zero).
+  const hasGrow1 = bases.includes("grow-[1]");
+  const zeroBasis = bases.includes("basis-[0%]") ? "basis-[0%]" : bases.includes("basis-0") ? "basis-0" : null;
+  if (hasGrow1 && zeroBasis && !bases.includes("shrink-0")) {
+    replace.set("grow-[1]", "flex-1");
+    drop.add(zeroBasis);
+  }
   const out: string[] = [];
   for (const b of bases) { if (drop.has(b)) continue; out.push(replace.get(b) ?? b); }
   return out;
@@ -509,6 +528,14 @@ export function prettifyBase(base: string): string {
   const pm = /^(w|h|min-w|min-h|basis|inset|inset-x|inset-y|top|right|bottom|left)-\[(\d*\.?\d+)%\]$/.exec(base);
   if (pm) {
     const v = parseFloat(pm[2]!);
+    // A percentage on a MAIN-SIZE axis whose containing block may be indefinite is NOT equal to the
+    // same length in px. `flex-basis:0%` against an auto-sized (indefinite) flex container falls back
+    // to CONTENT sizing per the flexbox spec, whereas `flex-basis:0` (definite zero) gives a zero base
+    // size — collapsing a `flex:1 1 0%` item to 0 in an auto-height column. `height`/`min-height` in %
+    // resolve to `auto` when the containing block's height is indefinite, the same hazard. So never
+    // rewrite `[0%]` to the definite `-0` for these prefixes; keep the literal `basis-[0%]`/`h-[0%]`.
+    // (Width/inset percentages resolve against the always-definite containing-block WIDTH — safe.)
+    if (v === 0 && (pm[1] === "basis" || pm[1] === "h" || pm[1] === "min-h")) return base;
     const frac = FRACTIONS.find(([p]) => Math.abs(p - v) < 0.4);
     return frac ? `${pm[1]}-${frac[1]}` : base;
   }

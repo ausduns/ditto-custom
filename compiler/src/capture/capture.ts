@@ -646,6 +646,40 @@ async function captureScreenshot(
   }
 }
 
+/**
+ * Pause every <video> and seek it to time 0, then wait for that seek to actually PAINT, so a
+ * screenshot taken right after is deterministic. A video's playback time is runtime state: a one-shot
+ * animation ends on its last frame, an autoplaying loop sits at an arbitrary offset, and the time a
+ * given viewport's shot happens to catch is nondeterministic. Without normalization the SOURCE and the
+ * (frame-0, non-playing) CLONE can show different frames of the same element — a phantom perceptual
+ * diff that no CSS change can close. Seeking BOTH sides to frame 0 before EVERY viewport screenshot
+ * removes it. `seeked` fires once the new frame is decoded; we still yield two rAFs so the compositor
+ * has painted it before the screenshot reads pixels. Bounded so a stalled/unseekable video can't hang.
+ */
+export async function normalizeVideoTime(page: import("playwright").Page): Promise<void> {
+  try {
+    await page.evaluate(async () => {
+      const vids = Array.from(document.querySelectorAll("video"));
+      const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+      const waits: Promise<void>[] = [];
+      for (const v of vids) {
+        try { v.pause(); } catch { /* ignore */ }
+        // Seek to 0 only when not already there (a fresh seek to the current time may not fire `seeked`).
+        if (Math.abs(v.currentTime) < 1e-3) continue;
+        waits.push(new Promise<void>((resolve) => {
+          let settled = false;
+          const done = () => { if (settled) return; settled = true; v.removeEventListener("seeked", done); resolve(); };
+          v.addEventListener("seeked", done, { once: true });
+          try { v.currentTime = 0; } catch { done(); }
+          setTimeout(done, 400); // bound: a stalled/unseekable video resolves anyway
+        }));
+      }
+      await Promise.all(waits);
+      await raf(); await raf(); // let the decoded frame composite before the screenshot reads pixels
+    });
+  } catch { /* a page with no videos / an eval hiccup must never block the screenshot */ }
+}
+
 export async function captureSite(opts: {
   url: string;
   outDir: string; // source/ directory
@@ -1219,7 +1253,13 @@ export async function captureSite(opts: {
 
       // Persist DOM snapshot, and (unless skipped for a production clone) the full-page screenshot.
       writeJSONCompact(join(captureDir, `dom-${vw}.json`), snapshot);
-      if (opts.screenshots !== false) await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      if (opts.screenshots !== false) {
+        // Normalize every video to frame 0 (paused) at THIS viewport before the shot — the clone is
+        // always at frame 0, so pinning the source there too makes the two channels comparable
+        // regardless of the playback time the viewport happened to catch.
+        await normalizeVideoTime(page);
+        await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
+      }
 
       // Stage 4: drive recognized affordances at the canonical viewport (opt-in).
       if (opts.interactions && vw === canonical) {

@@ -346,7 +346,10 @@ export function gate4Style(ir: IR, genSnaps: Record<number, PageSnapshot>, viewp
         // equal, only numerically far apart. Treat any two such large radii as equivalent so the
         // idiomatic `rounded-full` doesn't trip the exact-px compare; real radii stay ±2px.
         if (p === "borderTopLeftRadius" && pxNum(s.computed[p] ?? "") >= PILL_PX && pxNum(g.computed[p] ?? "") >= PILL_PX) continue;
-        if (!cmpNum(s.computed[p], g.computed[p], 2, 0)) { nodeOk = false; fails.push(p); }
+        const eq = p === "letterSpacing"
+          ? letterSpacingEquivalent(s.computed[p], g.computed[p])
+          : cmpNum(s.computed[p], g.computed[p], 2, 0);
+        if (!eq) { nodeOk = false; fails.push(p); }
       }
       for (const p of PX4_PROPS) {
         // `gap: normal` is the initial value and resolves to 0 for flex/grid, so it
@@ -403,6 +406,19 @@ function cmpNum(a: string | undefined, b: string | undefined, abs: number, pct: 
   const na = pxNum(a), nb = pxNum(b);
   if (Number.isNaN(na) || Number.isNaN(nb)) return (a ?? "") === (b ?? "");
   return withinAbs(na, nb, abs) || (pct > 0 && withinPct(na, nb, pct));
+}
+
+/** Compare two computed `letter-spacing` values within the ±2px style tolerance, treating the keyword
+ *  `normal` as `0px`. `letter-spacing: normal` is the initial value and adds no extra spacing (it
+ *  computes to 0), so `normal` ≡ `0px`; crucially, Chromium serializes a computed `letter-spacing: 0`
+ *  BACK as the keyword `normal`, so a genuinely-zero (or sub-0.1px, snapped-to-zero) tracking shows up
+ *  as `normal` on one side and `0px` on the other — a spelling difference that `cmpNum` alone reads as
+ *  a NaN → exact-string mismatch. Normalizing the keyword before the numeric compare removes that false
+ *  failure while a real tracking delta (> 2px) still fails. Mirrors the `gap: normal → 0px` handling. */
+export function letterSpacingEquivalent(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined) return true;
+  const norm = (v: string | undefined): string => (v ?? "").replace(/\bnormal\b/g, "0px");
+  return cmpNum(norm(a), norm(b), 2, 0);
 }
 
 // ---------- Gate 5: layout / section equivalence ----------

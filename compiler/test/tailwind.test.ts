@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { declToUtil, snapBase } from "../src/generate/tailwind.js";
+import { declToUtil, snapBase, prettifyBase, collapseBases } from "../src/generate/tailwind.js";
 
 // Zero-value gating. A named `-0` step only exists for props on Tailwind's spacing (or numeric)
 // scales; for the rest the class compiles to NOTHING — a silent no-op that ships the wrong style
@@ -69,5 +69,67 @@ describe("snapBase spacing-scale snapping", () => {
   it("leaves an already-clean scale utility unchanged and snaps 16px → mx-4", () => {
     assert.equal(snapBase("p-1"), "p-1");
     assert.equal(snapBase("mx-[16px]"), "mx-4");
+  });
+});
+
+// A percentage 0 on a MAIN-SIZE axis (flex-basis) or a %-of-indefinite-height axis (height/min-height)
+// is NOT the definite zero `-0`: `flex-basis:0%` content-sizes against an auto-sized flex container,
+// whereas `flex-basis:0` gives a zero base size (collapsing a `flex:1 1 0%` item in an auto-height
+// column). prettifyBase must keep those literal. Width/inset 0% resolve against the definite
+// containing-block width, so their `-0` rewrite stays.
+describe("prettifyBase 0% on indefinite-axis prefixes", () => {
+  it("keeps basis-[0%] literal (0% ≠ definite 0 for flex-basis)", () => {
+    assert.equal(prettifyBase("basis-[0%]"), "basis-[0%]");
+  });
+  it("keeps h-[0%] and min-h-[0%] literal (%-of-indefinite-height → auto)", () => {
+    assert.equal(prettifyBase("h-[0%]"), "h-[0%]");
+    assert.equal(prettifyBase("min-h-[0%]"), "min-h-[0%]");
+  });
+  it("still rewrites width/inset 0% to the definite -0 (definite containing-block width)", () => {
+    assert.equal(prettifyBase("w-[0%]"), "w-0");
+    assert.equal(prettifyBase("min-w-[0%]"), "min-w-0");
+    assert.equal(prettifyBase("left-[0%]"), "left-0");
+    assert.equal(prettifyBase("inset-x-[0%]"), "inset-x-0");
+  });
+  it("still rewrites non-zero fractions on every prefix (basis-[33.3333%] → basis-1/3)", () => {
+    assert.equal(prettifyBase("basis-[33.3333%]"), "basis-1/3");
+    assert.equal(prettifyBase("h-[50%]"), "h-1/2");
+    assert.equal(prettifyBase("min-h-[100%]"), "min-h-full");
+  });
+});
+
+// flex:1 1 0% is Tailwind's `flex-1` — fold the grow-[1] + zero-basis pair so the emitted class both
+// reads idiomatically AND resolves to the exact flex longhands (avoiding the basis-[0%] hazard).
+describe("collapseBases flex-1 folding", () => {
+  it("folds grow-[1] + basis-[0%] → flex-1 (shrink defaults to 1, elided)", () => {
+    assert.deepEqual(collapseBases(["grow-[1]", "basis-[0%]"]), ["flex-1"]);
+  });
+  it("folds grow-[1] + basis-0 (already-shortened band delta) → flex-1", () => {
+    assert.deepEqual(collapseBases(["grow-[1]", "basis-0"]), ["flex-1"]);
+  });
+  it("does NOT fold when shrink-0 is present (flex:1 0 0% ≠ flex-1)", () => {
+    assert.deepEqual(collapseBases(["grow-[1]", "shrink-0", "basis-[0%]"]).sort(), ["basis-[0%]", "grow-[1]", "shrink-0"]);
+  });
+  it("does NOT fold a non-zero basis (grow-[1] + basis-[50%] left as-is)", () => {
+    assert.deepEqual(collapseBases(["grow-[1]", "basis-[50%]"]).sort(), ["basis-[50%]", "grow-[1]"]);
+  });
+});
+
+// letter-spacing is authored at a finer scale than box lengths; a real -0.08px tracking is within
+// snapLen's 0.1px integer-snap window and would collapse to 0px → Chromium serializes it as `normal`
+// → a false style-gate mismatch. Tracking must skip the integer snap (snapBase keeps 2 decimals).
+describe("declToUtil letter-spacing sub-0.1px preservation", () => {
+  it("keeps a real -0.08px tracking (does NOT snap to tracking-[0px])", () => {
+    assert.equal(declToUtil("letter-spacing", "-0.08px"), "tracking-[-0.08px]");
+  });
+  it("keeps -0.0375px through declToUtil, then snapBase rounds to 2 decimals (not to zero)", () => {
+    assert.equal(declToUtil("letter-spacing", "-0.0375px"), "tracking-[-0.0375px]");
+    assert.equal(snapBase("tracking-[-0.0375px]"), "tracking-[-0.04px]");
+  });
+  it("still keeps a genuine zero as tracking-[0px]", () => {
+    assert.equal(declToUtil("letter-spacing", "0px"), "tracking-[0px]");
+  });
+  it("still integer-snaps a BOX length near an integer (204.9994px → 205px)", () => {
+    assert.equal(declToUtil("width", "204.9994px"), "w-[205px]");
   });
 });
