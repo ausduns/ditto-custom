@@ -80,6 +80,10 @@ export type FontFace = {
   display?: string;
   unicodeRange?: string;
   stretch?: string;
+  // Url of the stylesheet this face was declared in (undefined for an inline <style>, or for faces
+  // parsed out-of-band where the base is already baked into `src`). The src descriptor's relative
+  // url()s resolve against this, not the document — see readRules and parseSrcUrls.
+  baseHref?: string;
 };
 
 export type PageSnapshot = {
@@ -600,17 +604,34 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   // dropped, collapsing the box in the clone.
   const explicitWidthSelectors: string[] = [];
 
-  const absUrl = (u: string): string => {
-    try { return new URL(u, document.baseURI).href; } catch { return u; }
+  const absUrl = (u: string, base?: string): string => {
+    try { return new URL(u, base || document.baseURI).href; } catch { return u; }
   };
 
-  const harvestUrlsFromText = (text: string): void => {
+  // A relative url() inside a stylesheet resolves against THAT STYLESHEET'S url, not the document —
+  // `url("../media/x.woff2")` in `/a/b/css/sheet.css` points at `/a/b/media/x.woff2`, which is a
+  // different file from the document-relative `/media/x.woff2`. Resolving font/image srcs against
+  // `document.baseURI` fetches the wrong path (often the SPA router's 200+HTML shell), so a harvested
+  // face src must carry its owning sheet's base. Walk up through `@import` nesting (parentStyleSheet
+  // via ownerRule) to the nearest sheet that actually has an href; an inline `<style>` has none, so
+  // it correctly falls back to the document base.
+  const sheetBaseHref = (sheet: CSSStyleSheet | null | undefined): string | undefined => {
+    let s: CSSStyleSheet | null | undefined = sheet;
+    // Bound the walk defensively; @import chains are shallow in practice.
+    for (let i = 0; s && i < 32; i++) {
+      if (s.href) return s.href;
+      s = s.ownerRule?.parentStyleSheet ?? null;
+    }
+    return undefined;
+  };
+
+  const harvestUrlsFromText = (text: string, base?: string): void => {
     const re = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
       const raw = m[2];
       if (!raw || raw.startsWith("data:")) continue;
-      cssUrlSet.add(absUrl(raw));
+      cssUrlSet.add(absUrl(raw, base));
     }
   };
 
@@ -663,7 +684,12 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     return false;
   };
 
-  const readRules = (rules: CSSRuleList): void => {
+  // `base` is the url of the stylesheet these rules live in (undefined for an inline <style>, which
+  // resolves against the document). It is threaded so every harvested url() — @font-face src and
+  // ordinary style-rule url() alike — resolves relative to its OWNING sheet, not the page. The src
+  // string is left verbatim on the FontFace (parseSrcUrls re-absolutizes it downstream against the
+  // same base), but the base still drives the cssUrlSet entry that triggers the download.
+  const readRules = (rules: CSSRuleList, base?: string): void => {
     for (const rule of Array.from(rules)) {
       const type = rule.constructor.name;
       if (type === "CSSFontFaceRule") {
@@ -680,14 +706,15 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
             display: s.getPropertyValue("font-display") || undefined,
             unicodeRange: s.getPropertyValue("unicode-range") || undefined,
             stretch: s.getPropertyValue("font-stretch") || undefined,
+            baseHref: base,
           });
-          harvestUrlsFromText(src);
+          harvestUrlsFromText(src, base);
         }
       } else if (type === "CSSKeyframesRule") {
         keyframes.push((rule as CSSKeyframesRule).cssText);
       } else if (type === "CSSStyleRule") {
         const r = rule as CSSStyleRule;
-        if (r.style && r.style.cssText.includes("url(")) harvestUrlsFromText(r.style.cssText);
+        if (r.style && r.style.cssText.includes("url(")) harvestUrlsFromText(r.style.cssText, base);
         if (r.selectorText && r.style &&
           (isExplicitHeight(r.style.getPropertyValue("height")) ||
             isExplicitHeight(r.style.getPropertyValue("min-height")))) {
@@ -699,17 +726,20 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
           explicitWidthSelectors.push(r.selectorText);
         }
       } else if (type === "CSSMediaRule" || type === "CSSSupportsRule") {
-        try { readRules((rule as CSSGroupingRule).cssRules); } catch { /* ignore */ }
+        // Nested grouping rules live in the same sheet — keep the base.
+        try { readRules((rule as CSSGroupingRule).cssRules, base); } catch { /* ignore */ }
       } else if (type === "CSSImportRule") {
+        // The imported sheet is a separate file: its rules resolve against ITS url, falling back to
+        // the importing sheet's base only if the imported sheet reports none.
         const imp = rule as CSSImportRule;
-        try { if (imp.styleSheet) readRules(imp.styleSheet.cssRules); } catch { /* cross-origin */ }
+        try { if (imp.styleSheet) readRules(imp.styleSheet.cssRules, sheetBaseHref(imp.styleSheet) ?? base); } catch { /* cross-origin */ }
       }
     }
   };
 
   for (const sheet of Array.from(document.styleSheets)) {
     try {
-      readRules(sheet.cssRules);
+      readRules(sheet.cssRules, sheetBaseHref(sheet));
     } catch {
       // Cross-origin sheet — record its href so the capture layer can fetch the
       // raw text out-of-band and parse font-faces/urls from it.
@@ -746,7 +776,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     try { sheets.push(...(sr.adoptedStyleSheets || [])); } catch { /* ignore */ }
     try { sheets.push(...Array.from(sr.styleSheets || [])); } catch { /* ignore */ }
     for (const sheet of sheets) {
-      try { readRules(sheet.cssRules); } catch { if ((sheet as CSSStyleSheet).href) cssUrlSet.add(absUrl((sheet as CSSStyleSheet).href!)); }
+      try { readRules(sheet.cssRules, sheetBaseHref(sheet)); } catch { if ((sheet as CSSStyleSheet).href) cssUrlSet.add(absUrl((sheet as CSSStyleSheet).href!)); }
     }
   }
 

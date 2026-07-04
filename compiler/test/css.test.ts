@@ -269,6 +269,31 @@ describe("generateCss hidden-node banded geometry", () => {
     assert.ok(mobile.includes("visibility:hidden"), `child should carry the hide, got: ${mobile}`);
     assert.ok(!mobile.includes("left:10px"), `ancestor-hidden child must not emit geometry, got: ${mobile}`);
   });
+
+  it("emits per-band geometry for an occupying slide off-viewport at EVERY width, base included", () => {
+    // A carousel slide 6–12: a shrink-0 flex item off-screen RIGHT at every captured width — 375,
+    // the 1280 canonical base, AND 1920 — so it is never ownHidden, never ancestor-hidden, and never
+    // visibleByVp[base]=true (the walker marks `bbox.x >= vpW` invisible). It is NOT suppressed
+    // (no opacity:0 / visibility:hidden) and stays IN FLOW, so it still sets its flex track's
+    // cross-size. Without a band the base's canonical desktop width freezes across every viewport and
+    // inflates the mobile track. The band must carry THIS width's measured geometry.
+    const slide = nodeAt("n2", "div", {
+      375: { cs: { display: "block", position: "static", opacity: "1", width: "220px" }, bbox: { x: 400, y: 0, width: 220, height: 432 }, visible: false },
+      1280: { cs: { display: "block", position: "static", opacity: "1", width: "285px" }, bbox: { x: 1500, y: 0, width: 285, height: 532 }, visible: false },
+      1920: { cs: { display: "block", position: "static", opacity: "1", width: "285px" }, bbox: { x: 2200, y: 0, width: 285, height: 532 }, visible: false },
+    });
+    const track = nodeAt("n1", "div", {
+      375: { cs: { display: "flex", position: "relative" }, bbox: { x: 0, y: 0, width: 375, height: 432 } },
+      1280: { cs: { display: "flex", position: "relative" }, bbox: { x: 0, y: 0, width: 1280, height: 532 } },
+      1920: { cs: { display: "flex", position: "relative" }, bbox: { x: 0, y: 0, width: 1920, height: 532 } },
+    }, [slide]);
+    const root = nodeAt("n0", "body", {}, [track]);
+    const css = generateCss(ir3(root), new Map());
+    assert.ok(baseRule(css, "n2").includes("width:285px"), `base bakes canonical width, got: ${baseRule(css, "n2")}`);
+    const mobile = bandRule(css, /max-width/, "n2");
+    assert.ok(mobile.includes("width:220px"), `mobile band must carry the measured 220px width, got: ${mobile}`);
+    assert.ok(!mobile.includes("display:none"), "an occupying off-viewport slide must stay in layout");
+  });
 });
 
 // Fix 1 — mobile nav chip-strip overlap. A horizontally-scrollable flex strip (overflow-x:auto
@@ -921,6 +946,42 @@ describe("generateCss authored-height kept via own probe (T3)", () => {
     const css = generateCss(xIr(parent), new Map());
     const all = allRulesX(css, "n1");
     assert.ok(/height:300px/.test(all), `authored height must survive on own-probe evidence, got: ${all}`);
+  });
+});
+
+// R2 — the own-probe height trust (T3) must NEVER bake a document-height wrapper. A body/html/main
+// landmark, or any node whose captured box IS the page scroll height, probes hAuto:false/hFill:false
+// as document-level re-measure noise (min-h-screen + %-height chain), not an authored height. Baking
+// it pins the page to a fixed height — which, under an overflow:hidden main, hard-clips content drift
+// and blinds the layout gate's heightDelta. Such wrappers must keep flowing (auto height).
+describe("generateCss own-probe height trust never bakes a page-height wrapper (R2)", () => {
+  const explicit = (): RawSizing => ({ wAuto: false, wFill: false, hAuto: false, hFill: false });
+  // xIr sets perViewport.scrollHeight = 800 at every viewport.
+  function pageWrapper(tag: string, h: number) {
+    // A non-leaf wrapper with an in-flow child, whose own probe reads authored (hAuto/hFill false).
+    const child = xNode("n2", "div", Object.fromEntries(XVPS.map((vp) => [vp, { cs: { display: "block", position: "static" }, bbox: { x: 0, y: 0, width: vp, height: h } }])));
+    const wrap = xNode("n1", tag, Object.fromEntries(XVPS.map((vp) => [vp, { cs: { display: "block", position: "static", height: `${h}px` }, bbox: { x: 0, y: 0, width: vp, height: h }, sizing: explicit() }])), [child]);
+    return xNode("n0", "body", Object.fromEntries(XVPS.map((vp) => [vp, { bbox: { x: 0, y: 0, width: vp, height: h } }])), [wrap]);
+  }
+
+  it("does NOT bake a <main> landmark height even when its own probe is authored", () => {
+    const css = generateCss(xIr(pageWrapper("main", 800)), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/height:800px/.test(all), `main landmark must keep flowing, got: ${all}`);
+  });
+
+  it("does NOT bake a wrapper whose captured height IS the page scroll height (±2%)", () => {
+    // 792 is within 2% of the 800px scrollHeight — a page-height wrapper, not authored content.
+    const css = generateCss(xIr(pageWrapper("div", 792)), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/height:792px/.test(all), `near-page-height wrapper must keep flowing, got: ${all}`);
+  });
+
+  it("still bakes a genuinely authored height well below the page height", () => {
+    // 300px is far from the 800px scrollHeight — a real authored box (the T3 case) still survives.
+    const css = generateCss(xIr(pageWrapper("div", 300)), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/height:300px/.test(all), `authored sub-page height must still survive, got: ${all}`);
   });
 });
 

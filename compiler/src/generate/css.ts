@@ -2450,7 +2450,16 @@ function declsForViewport(
   // neither structural test detects the authored height. Trust the node's own probe.
   {
     const osz = node.sizingByVp?.[vp];
-    if (!noCollapse && !isLeaf && cs.height && cs.height !== "auto" && osz && osz.hAuto === false && osz.hFill === false) explicitHeight = true;
+    // Never trust this probe on a document-height wrapper. A root landmark (body/html/main) — or
+    // any node whose captured box IS the page's scroll height — probes hAuto:false/hFill:false as
+    // measurement noise (min-h-screen + the %-height re-measure chain at document level), not an
+    // authored height. Baking that px pins the whole page to a fixed height: combined with an
+    // `overflow:hidden` main it hard-clips any content-height drift, and it makes the layout gate's
+    // heightDelta tautologically zero (gate blindness). Such wrappers must keep flowing.
+    const isRootWrapper = tag === "body" || tag === "html" || tag === "main";
+    const isPageHeightBox = !!rootScrollHeight && !!nb && nb.height > 0 &&
+      Math.abs(nb.height - rootScrollHeight) <= rootScrollHeight * 0.02;
+    if (!noCollapse && !isLeaf && !isRootWrapper && !isPageHeightBox && cs.height && cs.height !== "auto" && osz && osz.hAuto === false && osz.hFill === false) explicitHeight = true;
   }
   if (!noCollapse && !isLeaf && cs.height && cs.height !== "auto" && nb) {
     const top = nb.y + (parseFloat(cs.paddingTop || "0") || 0) + (parseFloat(cs.borderTopWidth || "0") || 0);
@@ -3565,7 +3574,24 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
               continue;
             }
           } else {
-            continue;
+            // Not painted here, not display:none, not ancestor-hidden, and NOT visible at base —
+            // an item that is off-viewport/clipped at EVERY captured width, base included (the
+            // walker marks a box invisible when `bbox.x >= vpW`). A carousel slide 6–12 that lives
+            // off-screen right at 1280 (the canonical base) as well as at 375/768 lands here. It is
+            // the identical load-bearing case as the shownAtBase occupying arm above: a display:block
+            // flex item that still sets its flex track's cross-size, so freezing the base rule's
+            // canonical (desktop) geometry inflates the mobile track. Run the same occupying-box test —
+            // in-flow, unsuppressed, non-zero bbox at THIS width → fall through to the per-viewport
+            // delta so it carries this width's measured geometry. A genuinely suppressed
+            // (opacity:0 / visibility:hidden) or zero-box node keeps the current skip.
+            const bb = node.bboxByVp[b.vp];
+            const suppressed = pf(vpCs.opacity) === 0 || /^(hidden|collapse)$/.test(vpCs.visibility || "");
+            const inFlowHere = (vpCs.position || "static") === "static" || (vpCs.position || "static") === "relative";
+            if (!suppressed && inFlowHere && bb && (bb.width > 0 || bb.height > 0)) {
+              // Occupying, in-flow, off-viewport at every width — fall through to the per-viewport delta.
+            } else {
+              continue;
+            }
           }
         }
       }

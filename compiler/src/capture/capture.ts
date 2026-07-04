@@ -182,6 +182,28 @@ export function looksLikeVideoFile(bytes: Buffer): boolean {
   return false;
 }
 
+/** Container-magic check for accepted font bytes, mirroring `looksLikeVideoFile`. A router that
+ *  answers 200+HTML for an unknown `/media/*` path (common on SPA hosts) otherwise gets stored as
+ *  a `.woff2`; the browser rejects it as a font and the whole page falls through to a system
+ *  fallback. Accept only the real font-container signatures — woff2 (`wOF2`), woff (`wOFF`),
+ *  OpenType/CFF (`OTTO`), TrueType (`\x00\x01\x00\x00` or `true`/`ttcf`), and EOT (the version
+ *  header at bytes 8..11 is `\x01\x00\x01\x00`/`\x02\x00\x01\x00`, so key EOT off its unique
+ *  0x504C signature at offset 34) — and explicitly reject an HTML/text body. */
+export function looksLikeFontFile(bytes: Buffer): boolean {
+  if (bytes.length < 4) return false;
+  const b0 = bytes[0]!, b1 = bytes[1]!, b2 = bytes[2]!, b3 = bytes[3]!;
+  // A leading `<` (`<!DOCTYPE`, `<html`, `<?xml`, `<svg`) is never a binary font container.
+  if (b0 === 0x3c) return false;
+  const tag = bytes.subarray(0, 4).toString("latin1");
+  if (tag === "wOF2" || tag === "wOFF") return true; // woff2 / woff
+  if (tag === "OTTO" || tag === "true" || tag === "ttcf") return true; // CFF OpenType / TrueType / TrueType collection
+  if (b0 === 0x00 && b1 === 0x01 && b2 === 0x00 && b3 === 0x00) return true; // TrueType sfnt (\x00\x01\x00\x00)
+  // EOT: a little-endian byte count precedes a version/flags header; its stable marker is the
+  // 0x504C ("LP") magic at byte offset 34.
+  if (bytes.length >= 36 && bytes[34] === 0x4c && bytes[35] === 0x50) return true;
+  return false;
+}
+
 /**
  * A `<source>` candidate for the HTML media resource-selection algorithm. `media`/`type` are the
  * raw attribute strings (null/undefined when absent, matching a missing attribute).
@@ -1047,6 +1069,10 @@ export async function captureSite(opts: {
     // page stored under first-stored-wins ships a corrupt file). Left unstored, the
     // asset surfaces in visual_assets_missing instead.
     if (type === "video" && !looksLikeVideoFile(bytes)) return;
+    // Same guard for fonts: a 200+HTML body (SPA router answering an unknown /media/* path) must not
+    // be stored as a .woff2. Left unstored, the face surfaces as failed, so the font graph can fall
+    // back to a correctly-resolved duplicate url instead of shipping an impostor the browser rejects.
+    if (type === "font" && !looksLikeFontFile(bytes)) return;
     const a = assetMap.get(url) ?? recordAsset(url, type, null, null, "network");
     if (a.storedAs) return;
     // A `.lottie` (dotLottie) asset is a ZIP archive, not bare lottie-web JSON. lottie-web's
