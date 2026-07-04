@@ -188,6 +188,44 @@ function elementChildren(n: RawNode): RawNode[] {
   return n.children.filter((c) => (c as { text?: string }).text === undefined) as RawNode[];
 }
 
+/** True for a transform value that is visually the identity (no offset/rotation/scale):
+ *  the `none` keyword or an identity matrix/matrix3d the browser reports as noise. */
+export function isIdentityTransform(value: string | undefined): boolean {
+  if (!value || value === "none") return true;
+  const m = /^matrix\(([^)]*)\)$/.exec(value.trim());
+  if (m) {
+    const n = m[1]!.split(",").map((s) => parseFloat(s.trim()));
+    return n.length === 6 && n[0] === 1 && n[1] === 0 && n[2] === 0 && n[3] === 1 && n[4] === 0 && n[5] === 0;
+  }
+  const m3 = /^matrix3d\(([^)]*)\)$/.exec(value.trim());
+  if (m3) {
+    const n = m3[1]!.split(",").map((s) => parseFloat(s.trim()));
+    const id = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    return n.length === 16 && n.every((v, i) => v === id[i]);
+  }
+  return false;
+}
+
+/**
+ * Normalize per-viewport transform values so identity is represented uniformly as the literal
+ * `none`. Two problems this closes, both in the per-viewport delta emission downstream:
+ *   1. The browser reports "no transform" inconsistently — `none` at some widths, an identity
+ *      `matrix(1,0,0,1,0,0)` at others (composited-layer noise). The generator's default-skip
+ *      only recognizes `none`, so an identity matrix at the base viewport is emitted as a real
+ *      transform and then cascades across bands.
+ *   2. When ANY viewport carries a genuine (non-identity) transform, the identity value at the
+ *      other viewports must stay observable — canonicalizing it to `none` (not dropping it) lets
+ *      the generator emit the explicit reset so the non-identity transform can't leak into a band
+ *      where the source had none.
+ * Deterministic, in place; only touches the `transform` slot.
+ */
+export function canonicalizeTransforms(computedByVp: Record<number, StyleMap>): void {
+  for (const k of Object.keys(computedByVp)) {
+    const cs = computedByVp[Number(k)];
+    if (cs && isIdentityTransform(cs.transform)) cs.transform = "none";
+  }
+}
+
 /** Full identity signature (tag + id + class). */
 function sigFull(n: RawNode): string {
   return `${n.tag}#${n.attrs?.id ?? ""}.${(n.attrs?.class ?? "").trim()}`;
@@ -328,6 +366,10 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
       if (match.after) afterByVp[vw] = match.after;
       if (match.placeholder) placeholderByVp[vw] = match.placeholder;
     }
+    // Canonicalize identity transforms (none / identity matrix) to `none` at every viewport so
+    // the generator's per-band delta treats them uniformly and a scroll/composite-noise transform
+    // at one width can't leak across bands.
+    canonicalizeTransforms(computedByVp);
 
     const node: IRNode = {
       id: nextId(),

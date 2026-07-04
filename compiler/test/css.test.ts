@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { IR, IRNode, IRChild, StyleMap, BBox } from "../src/normalize/ir.js";
+import type { RawSizing } from "../src/capture/walker.js";
 import { generateCss } from "../src/generate/css.js";
 
 const VPS = [375, 1280];
@@ -288,5 +289,198 @@ describe("generateCss scroll-timeline animation suppression", () => {
     const css = generateCss(irWith(root), new Map());
     const rule = baseRule(css, "n1");
     assert.ok(rule.includes("animation-name:fadeInUp"), `time-based reveal keeps its animation, got: ${rule}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-viewport node builder (independent bbox / computed / sizing per width) plus a matching
+// 3-viewport IR wrapper — the fluid/centring/wrap detectors need ≥2 varying widths to run.
+const XVPS = [375, 768, 1280];
+type XPerVp = { cs?: StyleMap; bbox: BBox; sizing?: RawSizing; visible?: boolean };
+function xNode(id: string, tag: string, byVp: Record<number, XPerVp>, children: IRChild[] = []): IRNode {
+  const computedByVp: Record<number, StyleMap> = {};
+  const bboxByVp: Record<number, BBox> = {};
+  const visibleByVp: Record<number, boolean> = {};
+  const sizingByVp: Record<number, RawSizing> = {};
+  for (const vp of XVPS) {
+    const s = byVp[vp]!;
+    computedByVp[vp] = computed(s.cs);
+    bboxByVp[vp] = s.bbox;
+    visibleByVp[vp] = s.visible ?? true;
+    if (s.sizing) sizingByVp[vp] = s.sizing;
+  }
+  const n: IRNode = { id, tag, attrs: {}, visibleByVp, bboxByVp, computedByVp, children };
+  if (Object.keys(sizingByVp).length) n.sizingByVp = sizingByVp;
+  return n;
+}
+function xIr(root: IRNode): IR {
+  const ir = irWith(root);
+  ir.doc.viewports = XVPS;
+  ir.doc.sampleViewports = XVPS;
+  ir.doc.perViewport = Object.fromEntries(XVPS.map((vp) => [vp, { scrollHeight: 800, scrollWidth: vp, htmlBg: "rgb(255, 255, 255)", bodyBg: "rgb(255, 255, 255)", bodyColor: "rgb(0, 0, 0)", bodyFont: "Arial" }]));
+  return ir;
+}
+/** Every `.c<id>{…}` body (base + banded) concatenated, for asserting a value appears at some vp. */
+function allRulesX(css: string, id: string): string {
+  const re = new RegExp(`\\.c${id}\\{([^}]*)\\}`, "g");
+  let out = "", m: RegExpExecArray | null;
+  while ((m = re.exec(css))) out += m[1] + ";";
+  return out;
+}
+/** The `.c<id>{…}` body inside the first @media block whose query matches `mediaRe`. */
+function xBandRule(css: string, mediaRe: RegExp, id: string): string {
+  for (const m of css.matchAll(/@media ([^{]+) \{\n([\s\S]*?)\n\}/g)) {
+    if (!mediaRe.test(m[1]!)) continue;
+    const r = m[2]!.match(new RegExp(`\\.c${id}\\{([^}]*)\\}`));
+    if (r) return r[1]!;
+  }
+  return "";
+}
+
+// BUG A — a padded pill/section with LITERAL equal side margins (a fraction of the viewport, varying
+// across widths) must keep those px margins per band. The width-fill sizing probe is what tells the
+// centring detector these are load-bearing spacing, not margin-auto centring slack: on a box the
+// probe reads as a container-fill (width:100% reproduces it), `margin:auto` resolves to 0 and would
+// blow the box out to full-bleed, deleting the real margins.
+describe("generateCss literal-margin vs auto-centring", () => {
+  const fill = (): RawSizing => ({ wAuto: false, wFill: true, hAuto: true, hFill: true });
+  // A flex parent spanning the whole viewport, holding one padded pill child that fills the space
+  // BETWEEN its literal side margins (box + 2×margin == container at every width).
+  function pill() {
+    const child = xNode("n1", "div", {
+      375: { cs: { display: "flex", marginLeft: "15px", marginRight: "15px", width: "345px" }, bbox: { x: 15, y: 0, width: 345, height: 62 }, sizing: fill() },
+      768: { cs: { display: "flex", marginLeft: "30.7188px", marginRight: "30.7188px", width: "706.562px" }, bbox: { x: 30.72, y: 0, width: 706.56, height: 62 }, sizing: fill() },
+      1280: { cs: { display: "flex", marginLeft: "25.5938px", marginRight: "25.5938px", width: "1228.81px" }, bbox: { x: 25.59, y: 0, width: 1228.81, height: 62 }, sizing: fill() },
+    });
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 375, height: 62 } },
+      768: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 768, height: 62 } },
+      1280: { cs: { display: "flex" }, bbox: { x: 0, y: 0, width: 1280, height: 62 } },
+    }, [child]);
+    return parent;
+  }
+
+  it("keeps the literal px side margins on a width-filling pill (no mx-auto)", () => {
+    const css = generateCss(xIr(pill()), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(!/margin-left:auto/.test(all), `filling pill must not be centred with auto margins, got: ${all}`);
+    assert.ok(baseRule(css, "n1").includes("margin-left:25.5938px"), `base keeps the 1280 literal margin, got: ${baseRule(css, "n1")}`);
+    // The narrowest band (a `max-width` query with no `min-width`) carries the 375-vp literal margin.
+    const mobile = xBandRule(css, /^\(max-width/, "n1");
+    assert.ok(/margin-left:15px/.test(mobile), `mobile band keeps its literal 15px margin, got: ${mobile}`);
+  });
+
+  it("still emits margin:auto for a genuinely centred, width-CONSTRAINED block", () => {
+    // Content-sized (not a fill): the probe says width:auto re-derives it, width narrower than the
+    // container with symmetric slack that varies with width — real margin-auto centring.
+    const auto = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false });
+    const child = xNode("n1", "div", {
+      375: { cs: { display: "block", marginLeft: "15px", marginRight: "15px", width: "345px" }, bbox: { x: 15, y: 0, width: 345, height: 40 }, sizing: auto() },
+      768: { cs: { display: "block", marginLeft: "84px", marginRight: "84px", width: "600px" }, bbox: { x: 84, y: 0, width: 600, height: 40 }, sizing: auto() },
+      1280: { cs: { display: "block", marginLeft: "340px", marginRight: "340px", width: "600px" }, bbox: { x: 340, y: 0, width: 600, height: 40 }, sizing: auto() },
+    });
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 40 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 40 } },
+    }, [child]);
+    const css = generateCss(xIr(parent), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/margin-left:auto/.test(all), `a constrained centred block should still auto-centre, got: ${all}`);
+  });
+});
+
+// BUG C — a single-line text leaf whose unwrapped width nearly fills its column at every width gets
+// `white-space:nowrap`, so a sub-pixel column shortfall in the clone can't wrap it to a second line.
+describe("generateCss wrap-vulnerable single-line text", () => {
+  // Text bbox exactly fills the column (wMax == avail == bbox.width) at every width, single line
+  // (height == line-height), and is genuinely wrappable (wMin < wMax).
+  function edgeText(wMin: number) {
+    const szAt = (w: number): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false, wMin, wMax: w });
+    const leaf = xNode("n1", "div", {
+      375: { cs: { display: "block", lineHeight: "24px" }, bbox: { x: 0, y: 0, width: 107.81, height: 24 }, sizing: szAt(107.81) },
+      768: { cs: { display: "block", lineHeight: "24px" }, bbox: { x: 0, y: 0, width: 107.81, height: 24 }, sizing: szAt(107.81) },
+      1280: { cs: { display: "block", lineHeight: "20px" }, bbox: { x: 0, y: 0, width: 107.81, height: 20 }, sizing: szAt(107.81) },
+    }, [{ text: "CEO — Academy" }]);
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 107.81, height: 24 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 107.81, height: 24 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 107.81, height: 20 } },
+    }, [leaf]);
+    return parent;
+  }
+
+  it("emits white-space:nowrap for text flush against its column edge", () => {
+    const css = generateCss(xIr(edgeText(58.33)), new Map());
+    assert.ok(baseRule(css, "n1").includes("white-space:nowrap"), `edge-flush single-line text should get nowrap, got: ${baseRule(css, "n1")}`);
+  });
+
+  it("does NOT emit nowrap for a single unbreakable token (wMin == wMax — can't wrap)", () => {
+    const css = generateCss(xIr(edgeText(107.81)), new Map());
+    assert.ok(!baseRule(css, "n1").includes("white-space:nowrap"), `an unbreakable token needs no nowrap, got: ${baseRule(css, "n1")}`);
+  });
+
+  it("does NOT emit nowrap for a genuinely wrapping multi-line paragraph", () => {
+    // Two line boxes tall (height ≈ 2×line-height) → already wrapping, must stay wrappable.
+    const wMin = 100, wMax = 400;
+    const szAt = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false, wMin, wMax });
+    const para = xNode("n1", "p", {
+      375: { cs: { display: "block", lineHeight: "24px" }, bbox: { x: 0, y: 0, width: 345, height: 72 }, sizing: szAt() },
+      768: { cs: { display: "block", lineHeight: "24px" }, bbox: { x: 0, y: 0, width: 700, height: 48 }, sizing: szAt() },
+      1280: { cs: { display: "block", lineHeight: "24px" }, bbox: { x: 0, y: 0, width: 400, height: 48 }, sizing: szAt() },
+    }, [{ text: "A longer paragraph that wraps across multiple lines depending on the width." }]);
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 345, height: 72 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 700, height: 48 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 400, height: 48 } },
+    }, [para]);
+    const css = generateCss(xIr(parent), new Map());
+    assert.ok(!allRulesX(css, "n1").includes("white-space:nowrap"), `a wrapping paragraph must not be forced nowrap, got: ${allRulesX(css, "n1")}`);
+  });
+
+  it("does NOT emit nowrap for text with comfortable slack in its container", () => {
+    const szAt = (): RawSizing => ({ wAuto: true, wFill: false, hAuto: true, hFill: false, wMin: 60, wMax: 90 });
+    const leaf = xNode("n1", "div", {
+      375: { cs: { display: "block", lineHeight: "20px" }, bbox: { x: 0, y: 0, width: 90, height: 20 }, sizing: szAt() },
+      768: { cs: { display: "block", lineHeight: "20px" }, bbox: { x: 0, y: 0, width: 90, height: 20 }, sizing: szAt() },
+      1280: { cs: { display: "block", lineHeight: "20px" }, bbox: { x: 0, y: 0, width: 90, height: 20 }, sizing: szAt() },
+    }, [{ text: "Nav link" }]);
+    // Wide container (300px+) — the 90px text has plenty of room, no wrap risk.
+    const parent = xNode("n0", "body", {
+      375: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 375, height: 20 } },
+      768: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 768, height: 20 } },
+      1280: { cs: { display: "block" }, bbox: { x: 0, y: 0, width: 1280, height: 20 } },
+    }, [leaf]);
+    const css = generateCss(xIr(parent), new Map());
+    assert.ok(!baseRule(css, "n1").includes("white-space:nowrap"), `slack text needs no nowrap, got: ${baseRule(css, "n1")}`);
+  });
+});
+
+// Cross-band transform identity — a node with a NON-identity transform at one band must emit the
+// explicit identity `transform:none` at the bands where the source is untransformed, so the
+// transform can't cascade across bands and freeze at a width the source left untransformed.
+describe("generateCss cross-band transform identity", () => {
+  it("emits transform:none at a band where a node with a non-identity transform elsewhere is identity", () => {
+    const el = xNode("n1", "div", {
+      375: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      768: { cs: { transform: "matrix(1, 0, 0, 1, 40, 0)" }, bbox: { x: 40, y: 0, width: 375, height: 40 } },
+      1280: { cs: { transform: "matrix(1, 0, 0, 1, 40, 0)" }, bbox: { x: 40, y: 0, width: 375, height: 40 } },
+    });
+    const root = xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 40 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 40 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 40 } } }, [el]);
+    const css = generateCss(xIr(root), new Map());
+    const all = allRulesX(css, "n1");
+    assert.ok(/transform:matrix/.test(all), `the non-identity transform must be emitted, got: ${all}`);
+    assert.ok(/transform:none/.test(all), `the identity band must emit transform:none so it can't cascade, got: ${all}`);
+  });
+
+  it("does NOT emit transform:none for a node that is identity at every band", () => {
+    const el = xNode("n1", "div", {
+      375: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      768: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+      1280: { cs: { transform: "none" }, bbox: { x: 0, y: 0, width: 375, height: 40 } },
+    });
+    const root = xNode("n0", "body", { 375: { bbox: { x: 0, y: 0, width: 375, height: 40 } }, 768: { bbox: { x: 0, y: 0, width: 768, height: 40 } }, 1280: { bbox: { x: 0, y: 0, width: 1280, height: 40 } } }, [el]);
+    const css = generateCss(xIr(root), new Map());
+    assert.ok(!allRulesX(css, "n1").includes("transform:none"), `an always-identity node needs no explicit transform, got: ${allRulesX(css, "n1")}`);
   });
 });

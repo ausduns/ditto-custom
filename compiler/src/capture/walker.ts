@@ -380,9 +380,22 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
         const hf = el.getBoundingClientRect().height;
         // Tight 0.5px: only call a dimension "reproduced" when auto/100% lands essentially exactly,
         // so a drop can't accumulate a visible shift across many elements (favours fidelity).
+        let hAuto = Math.abs(ha - r.height) <= 0.5;
+        let hFill = Math.abs(hf - r.height) <= 0.5;
+        // Circular-height guard: a box whose fill child (height:100%) pins it back up makes BOTH
+        // `height:auto` and `height:100%` reproduce the box, so the raw verdict reads hAuto (drop) —
+        // even though the height is authored (e.g. `100vh` on a hero, an explicit px section). Both
+        // sides then wait on each other and the box collapses. When this element's own cascade/inline
+        // style declares an explicit definite height, trust that declaration: the height is authored,
+        // so it is neither content-sized (hAuto) nor a parent fill (hFill). Only overrides when auto
+        // actually reproduced — a genuine explicit height that auto already shrinks stays hAuto:false.
+        if ((hAuto || hFill) && r.height > 2 && authorsExplicitHeight(el, sh)) {
+          hAuto = false;
+          hFill = false;
+        }
         sizing = {
-          wAuto: Math.abs(wa - r.width) <= 0.5, wFill: Math.abs(wf - r.width) <= 0.5, hAuto: Math.abs(ha - r.height) <= 0.5,
-          hFill: Math.abs(hf - r.height) <= 0.5,
+          wAuto: Math.abs(wa - r.width) <= 0.5, wFill: Math.abs(wf - r.width) <= 0.5, hAuto,
+          hFill,
           wMin: Math.round(wmin * 100) / 100, wMax: Math.round(wmax * 100) / 100,
         };
       } finally {
@@ -492,6 +505,14 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
   const cssUrlSet = new Set<string>();
   const keyframes: string[] = [];
   const cssVars: Record<string, string> = {};
+  // Selectors that AUTHOR an explicit, definite height/min-height (px/rem/em/vh/vw/…,
+  // NOT auto, NOT a percentage, NOT a keyword). Harvested once from the cascade below and
+  // consulted by the sizing probe to break circular parent/child height verdicts: when a box
+  // and its fill child mutually justify each other's height, `height:auto` reproduces the box
+  // for a reason that is NOT "content-sized", so the probe alone reads hAuto:true and the
+  // authored dimension gets dropped downstream. A declared explicit length is ground truth that
+  // the height is load-bearing, so we trust the declaration over the reflow verdict.
+  const explicitHeightSelectors: string[] = [];
 
   const absUrl = (u: string): string => {
     try { return new URL(u, document.baseURI).href; } catch { return u; }
@@ -505,6 +526,39 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       if (!raw || raw.startsWith("data:")) continue;
       cssUrlSet.add(absUrl(raw));
     }
+  };
+
+  // True when a `height`/`min-height` value is an explicit, definite length the browser resolves
+  // to a fixed px box (px/rem/em/vh/vw/vmin/vmax/ch/…, or a calc/min/max/clamp over them). False for
+  // `auto`, an empty value, a pure percentage (resolves against the parent — that's the fill case the
+  // hFill probe already handles), `0`, and intrinsic keywords (fit-/min-/max-content). A definite
+  // authored height is load-bearing and must survive even when the reflow probe reads hAuto:true.
+  const isExplicitHeight = (raw: string): boolean => {
+    const v = (raw || "").trim().toLowerCase();
+    if (!v || v === "auto" || v === "0" || v === "0px" || v === "none") return false;
+    if (v === "fit-content" || v === "min-content" || v === "max-content" || v === "inherit" ||
+      v === "initial" || v === "unset" || v === "revert" || v === "revert-layer") return false;
+    // A bare percentage resolves against the parent (fill), not an authored definite length.
+    if (/^[\d.]+%$/.test(v)) return false;
+    // A definite length unit (or a calc()/min()/max()/clamp() that contains one) anchors the box.
+    return /(?:^|[\s(*/+-])[\d.]+(?:px|rem|em|vh|vw|vmin|vmax|svh|lvh|dvh|cm|mm|in|pt|pc|ex|ch|q)\b/.test(v);
+  };
+
+  // Does this element author an explicit definite height — via its own inline style (passed as
+  // `inlineHeight`, already read by the probe) or via any matched cascade rule harvested into
+  // `explicitHeightSelectors`? getComputedStyle resolves height to used px (so `100vh` reads as a
+  // plain number and is indistinguishable from a content height there); the specified value is only
+  // recoverable from the inline declaration and the cascade, which is why we consult both.
+  const authorsExplicitHeight = (el: Element, inlineHeight: string): boolean => {
+    if (isExplicitHeight(inlineHeight)) return true;
+    try {
+      const inlineMin = (el as HTMLElement).style?.getPropertyValue("min-height") || "";
+      if (isExplicitHeight(inlineMin)) return true;
+    } catch { /* ignore */ }
+    for (const sel of explicitHeightSelectors) {
+      try { if (el.matches(sel)) return true; } catch { /* invalid/unsupported selector */ }
+    }
+    return false;
   };
 
   const readRules = (rules: CSSRuleList): void => {
@@ -532,6 +586,11 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       } else if (type === "CSSStyleRule") {
         const r = rule as CSSStyleRule;
         if (r.style && r.style.cssText.includes("url(")) harvestUrlsFromText(r.style.cssText);
+        if (r.selectorText && r.style &&
+          (isExplicitHeight(r.style.getPropertyValue("height")) ||
+            isExplicitHeight(r.style.getPropertyValue("min-height")))) {
+          explicitHeightSelectors.push(r.selectorText);
+        }
       } else if (type === "CSSMediaRule" || type === "CSSSupportsRule") {
         try { readRules((rule as CSSGroupingRule).cssRules); } catch { /* ignore */ }
       } else if (type === "CSSImportRule") {

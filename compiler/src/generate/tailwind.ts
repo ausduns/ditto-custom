@@ -563,7 +563,6 @@ function namedText(base: string): string | null {
 // nearest scale step / integer px when comfortably INSIDE that budget (ε well under the gate tol), so
 // the markup reads hand-authored. Bounded ε + the layout & perceptual gates backstop any accumulation;
 // values not near a step stay arbitrary because they are genuine one-offs.
-const SNAP_SPACE_PX = 1.0; // padding/margin/gap/inset/size → nearest 0.25rem scale step within this
 const SNAP_TYPE_PX = 0.6;  // font-size/line-height/radius → nearest integer px within this
 const NAMED_K_SORTED = [...NAMED_K].sort((a, b) => a - b);
 function nearestNamedK(k: number): number {
@@ -571,7 +570,7 @@ function nearestNamedK(k: number): number {
   for (const c of NAMED_K_SORTED) if (Math.abs(c - k) < Math.abs(best - k)) best = c;
   return best;
 }
-function snapBase(base: string): string {
+export function snapBase(base: string): string {
   const m = /^(-?)([a-z][a-z-]*)-\[(-?\d*\.?\d+)(px|rem)\]$/.exec(base);
   if (!m) return base;
   const neg = m[1]!, prefix = m[2]!, px = parseFloat(m[3]!) * (m[4] === "rem" ? 16 : 1);
@@ -587,10 +586,16 @@ function snapBase(base: string): string {
     if (Math.abs(r - px) <= SNAP_TYPE_PX && r in RADIUS_SUFFIX) return `${prefix}${RADIUS_SUFFIX[r]}`;
     return base;
   }
-  // spacing / size → nearest named scale step (0.25rem grid)
+  // spacing / size → nearest named scale step (0.25rem grid). Only snap a value that lands ESSENTIALLY
+  // ON a step (≤0.25px): the scale is 2px-granular (`p-0.5`=2px, `p-1.5`=6px), so a captured value ≥0.25px
+  // off the nearest step is a genuine sub-step measurement (3.5px is BETWEEN 2px and 4px — not on the
+  // scale). Snapping such a value up by +0.5px per side accumulates across the links of a fixed-width
+  // flex row until the items overflow and wrap to a second line; the exact `p-[3.5px]` cannot. The wider
+  // ±1px budget the gate tolerates in isolation is unsafe here because the error is systematic, not
+  // random. Values genuinely on a step (2px→`p-0.5`, 4px→`p-1`) still snap.
   if (SCALE_PREFIXES.has(prefix)) {
     const k = nearestNamedK(px / 4);
-    if (Math.abs(k * 4 - px) <= SNAP_SPACE_PX) return k === 0 ? `${neg}${prefix}-0` : `${neg}${prefix}-${k}`;
+    if (Math.abs(k * 4 - px) <= 0.25) return k === 0 ? `${neg}${prefix}-0` : `${neg}${prefix}-${k}`;
   }
   return base;
 }

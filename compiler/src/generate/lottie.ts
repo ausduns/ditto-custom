@@ -126,7 +126,7 @@ const byCid = (cid: string): HTMLElement | null => document.querySelector('[data
 export default function DittoLottie({ spec }: { spec: LottieSpec }) {
   useEffect(() => {
     const stopped = (window as any).__dittoMotionStopped === true;
-    const anims: Array<{ destroy: () => void; goToAndStop: (value: number, isFrame?: boolean) => void }> = [];
+    const anims: Array<{ destroy: () => void; goToAndStop: (value: number, isFrame?: boolean) => void; addEventListener: (name: string, cb: () => void) => void }> = [];
     let cancelled = false;
     void (async () => {
       const lottie = (await import("lottie-web")).default;
@@ -134,17 +134,38 @@ export default function DittoLottie({ spec }: { spec: LottieSpec }) {
       for (const it of spec.items) {
         const el = byCid(it.cid);
         if (!el) continue;
-        // clear the captured placeholder frame so it never stacks with the live render
-        el.innerHTML = "";
         try {
+          // Mount the live animation into an OVERLAY child, keeping the captured placeholder
+          // frame in the DOM until lottie signals a successful load — a failed load (bad JSON,
+          // network) then leaves the placeholder intact instead of erasing the container to blank.
+          const mount = document.createElement("div");
+          mount.style.position = "absolute";
+          mount.style.inset = "0";
+          mount.style.opacity = "0";
+          const cs = getComputedStyle(el);
+          if (cs.position === "static") el.style.position = "relative";
+          el.appendChild(mount);
           const anim = lottie.loadAnimation({
-            container: el,
+            container: mount,
             renderer: it.renderer === "canvas" ? "canvas" : "svg",
             loop: it.loop,
             autoplay: it.autoplay && !stopped,
             ...(it.path ? { path: it.path } : { animationData: it.animationData as object }),
             rendererSettings: { preserveAspectRatio: "xMidYMid meet" },
           });
+          // Swap only once the animation is genuinely ready: reveal the live render and remove
+          // every original child (the placeholder) so the two never stack.
+          const reveal = () => {
+            mount.style.opacity = "1";
+            for (const child of Array.from(el.childNodes)) if (child !== mount) el.removeChild(child);
+            mount.style.position = "";
+            mount.style.inset = "";
+          };
+          // DOMLoaded fires only after the JSON parsed and the first frame rendered — the
+          // right moment to reveal the live render and drop the placeholder. data_failed
+          // (bad JSON / fetch error) tears the empty mount back out, leaving the placeholder.
+          anim.addEventListener("DOMLoaded", reveal);
+          anim.addEventListener("data_failed", () => { try { el.removeChild(mount); } catch {} });
           if (stopped) { try { anim.goToAndStop(0, true); } catch {} }
           anims.push(anim);
         } catch {

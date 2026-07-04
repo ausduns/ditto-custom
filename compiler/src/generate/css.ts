@@ -2208,6 +2208,8 @@ function declsForViewport(
   geometry: GeometryPlan = GEOMETRY_NONE,
   dropGridRows = false,
   dropViewportMaxWidth = false,
+  nowrapText = false,
+  keepIdentityTransform = false,
 ): Map<string, string> {
   const cs = node.computedByVp[vp];
   const out = new Map<string, string>();
@@ -2478,6 +2480,13 @@ function declsForViewport(
       // list reset is none; emit whatever the source uses (incl. none).
     } else if (prop === "minWidth") {
       if (value === "auto" || (value === "0px" && !isFlexGridItem) || (value === "0px" && inScrollXFlexStrip)) continue;
+    } else if (prop === "transform") {
+      // Emit the identity `transform:none` explicitly at a viewport whose value is `none` WHEN the node
+      // carries a non-identity transform at some OTHER band — otherwise the non-identity value cascades
+      // across bands and freezes at a width the source left untransformed. (Identity matrices are already
+      // canonicalized to the literal "none" upstream, so the string compare is reliable.) When the node
+      // is identity everywhere, this stays a normal default elision.
+      if (value === "none" && !keepIdentityTransform) continue;
     } else if (def === "__never__") {
       // always emit (display/color/fontFamily/fontSize handled below for inherit)
     } else if (isDefault(def, value)) {
@@ -2505,6 +2514,15 @@ function declsForViewport(
     }
     out.set(kebab(prop), outValue);
   }
+
+  // Wrap-vulnerable single-line text: the text renders on one line at every captured width and its
+  // unwrapped width nearly equals the container's available width, so a sub-pixel width shortfall in
+  // the clone (a column resolving ~0.6px narrower) tips it onto a second line, shifting everything
+  // below. `white-space:nowrap` holds it to one line — identical to the capture (already single-line
+  // at every width) but immune to the rounding shortfall. Only the source `whiteSpace` value that
+  // already collapses runs (`normal`/`nowrap`) is overridden; `pre`/`pre-wrap`/`break-spaces` preserve
+  // authored whitespace and are left untouched (the caller's detector also excludes them).
+  if (nowrapText) out.set("white-space", "nowrap");
 
   // Centered max-width container: emit auto side margins so the browser centers
   // it at every width. getComputedStyle sometimes reports 0 for resolved auto
@@ -2641,7 +2659,14 @@ function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
   // marquee). Converting fixed spacing to `auto` deletes it when the parent shrink-wraps the child
   // (auto resolves to 0) — exactly how the testimonial inter-card gap vanished. Literal margins
   // reproduce that spacing at every width regardless of the parent's resolved width.
-  if (ml > 0.5 && Math.abs(ml - mr) < 1 && nb.width < pb.width - 4 && marginsVaryAcrossVps(node)) return true;
+  // The width must ALSO be genuinely constrained: a box the sizing probe reads as a container-FILL
+  // (`width:100%` reproduces it) has no free space for auto margins to absorb — the emitted width
+  // is set to 100% (fill/fillcap), so `margin:auto` resolves to 0 and silently deletes real literal
+  // px side margins, blowing a padded pill/section out to full-bleed. Equal literal margins are the
+  // geometric TWIN of centering slack (both split the free space symmetrically), so this probe read
+  // is the only reliable discriminator between them; when the box fills, keep the literal margins.
+  const fillsAtVp = node.sizingByVp?.[vp]?.wFill === true;
+  if (ml > 0.5 && Math.abs(ml - mr) < 1 && nb.width < pb.width - 4 && marginsVaryAcrossVps(node) && !fillsAtVp) return true;
   if (parentFlexGrid) return false;
   // Signal 2: bbox-centered within the parent content box with ~0 reported margins.
   if (Math.abs(ml) > 0.5 || Math.abs(mr) > 0.5) return false; // margins already explain position
@@ -2652,6 +2677,45 @@ function centeredAtVp(node: IRNode, parentNode: IRNode, vp: number): boolean {
   const leftGap = nb.x - contentLeft;
   const rightGap = contentRight - (nb.x + nb.width);
   return leftGap > 1 && rightGap > 1 && Math.abs(leftGap - rightGap) < 1.5 && nb.width < contentRight - contentLeft - 2;
+}
+
+/** A single-line text leaf whose unwrapped width nearly fills its container's available width at
+ *  EVERY captured viewport where it's painted — so any sub-pixel width shortfall in the clone (a
+ *  column resolving fractionally narrower) tips it onto a second line. Such a node earns an explicit
+ *  `white-space:nowrap` (see declsForViewport) to stay one line as it did in the capture.
+ *  Conservative by construction — every guard must hold at every painted viewport:
+ *   • text leaf (direct text, no element children), whitespace not already preserved (`pre*`);
+ *   • single line: box height ≈ one line box (line-height + vertical padding/border), so a genuinely
+ *     wrapping paragraph (≥2 line boxes tall) is excluded;
+ *   • wrap-vulnerable: max-content (unwrapped) width ≥ available container width − 2 and ≤ it + 1 —
+ *     the text needs essentially all the available width, with no slack for a rounding shortfall;
+ *   • genuinely wrappable: min-content < max-content − 2, so a single unbreakable token (which can
+ *     never wrap, making nowrap a redundant no-op) is skipped to keep the emission minimal.
+ *  Relies on the sizing probe's wMin/wMax (present only for in-flow probed leaves); absent ⇒ no emit. */
+function nowrapWrapVulnerable(node: IRNode, parentNode: IRNode | undefined, viewports: number[]): boolean {
+  if (!parentNode) return false;
+  if (hasElementChild(node)) return false;
+  if (!node.children.some((c) => isTextChild(c) && c.text.trim() !== "")) return false;
+  if (REPLACED.has(node.tag) || node.tag === "canvas" || node.tag.includes("-")) return false;
+  let painted = 0;
+  for (const vp of viewports) {
+    const cs = node.computedByVp[vp]; const nb = node.bboxByVp[vp];
+    if (!cs || !nb || !node.visibleByVp[vp] || (cs.display || "") === "none") continue;
+    if (!(nb.width > 0) || !(nb.height > 0)) continue;
+    const ws = cs.whiteSpace || "normal";
+    if (ws !== "normal" && ws !== "nowrap") return false; // pre/pre-wrap/break-spaces preserve authored whitespace
+    const sz = node.sizingByVp?.[vp];
+    const wMax = sz?.wMax; const wMin = sz?.wMin;
+    if (wMax == null || wMin == null) return false;
+    const lineBox = pf(cs.lineHeight) + pf(cs.paddingTop) + pf(cs.paddingBottom) + pf(cs.borderTopWidth) + pf(cs.borderBottomWidth);
+    if (!(lineBox > 0) || Math.abs(nb.height - lineBox) > 2.5) return false; // not single-line
+    const avail = containingWidthAt(node, parentNode, vp);
+    if (avail == null) return false;
+    if (!(wMax >= avail - 2 && wMax <= avail + 1)) return false; // not right at the container edge
+    if (!(wMin < wMax - 2)) return false;                        // single unbreakable token — can't wrap
+    painted++;
+  }
+  return painted >= 1;
 }
 
 function hasPxMaxWidthCap(node: IRNode, viewports: number[]): boolean {
@@ -3106,6 +3170,21 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       : inferred.plan;
     const centerAlways = inferred.centerAlways;
     const centeredAtAnySample = !!layoutParent && sampleVps.some((vp) => centeredAtVp(node, layoutParent, vp));
+    // A single-line text leaf sitting flush against its container's available width at every painted
+    // width → `white-space:nowrap` so a sub-pixel column shortfall in the clone can't wrap it. Decided
+    // once per node (uniform across bands); measured against layoutParent to see through contents wrappers.
+    const nowrapText = !isContents && nowrapWrapVulnerable(node, layoutParent, sampleVps);
+    // If this node has a NON-identity transform at any painted band, the identity `none` must be
+    // emitted at the bands that have it so the transform can't cascade across bands (freezing a
+    // width the source left untransformed). Identity matrices are canonicalized to "none" upstream.
+    let hasNonIdentityTransform = false, hasIdentityTransform = false;
+    for (const vp of sampleVps) {
+      const t = node.computedByVp[vp]?.transform;
+      if (t === undefined) continue;
+      if (t === "none") hasIdentityTransform = true;
+      else hasNonIdentityTransform = true;
+    }
+    const keepIdentityTransform = hasNonIdentityTransform && hasIdentityTransform;
     const stableCenter =
       centerAlways ||
       sourceMarginAutoIntent(node) ||
@@ -3175,7 +3254,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
       dropInsets.delete("left");
     }
     const animOwned = animOwnedProps(node, baseVp); // opacity/transform driven by an infinite animation
-    const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth), tokenResolver);
+    const baseDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[baseVp], baseVp, assetMap, centeredBase, colorVar, ir.doc.perViewport[baseVp]?.scrollHeight, widthPlan, gridColsByVp?.get(baseVp), gridRowsByVp?.get(baseVp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform), tokenResolver);
     const nr: NodeRule = { base: baseDecls, bands: [] };
 
     // Per-band overrides (delta vs base), using the parent's value AT THAT viewport.
@@ -3247,7 +3326,7 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
         }
       }
       const centeredVp = stableCenter || (layoutParent ? centeredAtVp(node, layoutParent, b.vp) : false);
-      const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth), tokenResolver);
+      const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth, nowrapText, keepIdentityTransform), tokenResolver);
       const delta = new Map<string, string>();
       for (const [k, v] of vpDecls) if (baseDecls.get(k) !== v) delta.set(k, v);
       for (const [k] of baseDecls) if (!vpDecls.has(k)) delta.set(k, resetValue(k));

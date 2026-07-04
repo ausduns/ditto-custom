@@ -211,3 +211,109 @@ describe("walker font-metric probe tagging (fix 4)", () => {
     assert.ok(!sr.probe, "sr-only accessible text is not a probe");
   });
 });
+
+describe("walker sizing probe: circular authored-height guard", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("keeps an explicit 100vh height (circular hero/fill-child pair)", async () => {
+    // A hero authored `height:100vh` with a `height:100%` fill child: setting the hero to
+    // `height:auto` still reproduces its box because the child pins it back, so the raw probe
+    // would read hAuto:true and the authored 100vh would be dropped — hero collapses to 0.
+    const snap = await capture(`
+      <style>
+        .hero { height: 100vh; display: flex; }
+        .fill { height: 100%; width: 100%; }
+      </style>
+      <section class="hero"><div class="fill"><p>content</p></div></section>`);
+    const hero = findByClass(snap.root, "hero")!;
+    assert.ok(hero.sizing, "hero was probed");
+    assert.equal(hero.sizing!.hAuto, false, "explicit 100vh is not content-sized");
+    assert.equal(hero.sizing!.hFill, false, "explicit 100vh is authored, not a parent fill");
+    // Box actually equals the viewport height (720), proving the circular reproduction.
+    assert.ok(Math.abs(hero.bbox.height - 720) <= 1, "hero rendered at 100vh");
+  });
+
+  it("keeps an explicit px height whose fill child reproduces it", async () => {
+    const snap = await capture(`
+      <style>
+        .section { height: 400px; display: flex; }
+        .fill { height: 100%; width: 100%; }
+      </style>
+      <div class="section"><div class="fill"><p>content</p></div></div>`);
+    const section = findByClass(snap.root, "section")!;
+    assert.ok(section.sizing, "section was probed");
+    assert.equal(section.sizing!.hAuto, false, "explicit 400px is not content-sized");
+    assert.equal(section.sizing!.hFill, false, "explicit 400px is authored, not a fill");
+    assert.ok(Math.abs(section.bbox.height - 400) <= 1, "section rendered at 400px");
+  });
+
+  it("keeps an explicit height authored via inline style", async () => {
+    const snap = await capture(`
+      <style>.fill { height: 100%; width: 100%; }</style>
+      <div class="box" style="height: 300px; display: flex;">
+        <div class="fill"><p>content</p></div>
+      </div>`);
+    const box = findByClass(snap.root, "box")!;
+    assert.ok(box.sizing, "box was probed");
+    assert.equal(box.sizing!.hAuto, false, "inline explicit height is kept");
+    assert.equal(box.sizing!.hFill, false, "inline explicit height is not a fill");
+  });
+
+  it("resolves the mutual parent/child pair without disturbing the fill child", async () => {
+    // The child is a GENUINE fill (height:100%) and must keep hFill:true / hAuto:false so the
+    // generator emits h-full for it; only the parent's circular verdict is corrected.
+    const snap = await capture(`
+      <style>
+        .outer { height: 500px; display: flex; }
+        .inner { height: 100%; width: 100%; }
+      </style>
+      <div class="outer"><div class="inner"><p>content</p></div></div>`);
+    const outer = findByClass(snap.root, "outer")!;
+    const inner = findByClass(snap.root, "inner")!;
+    assert.equal(outer.sizing!.hAuto, false, "parent explicit height kept");
+    assert.equal(outer.sizing!.hFill, false, "parent is authored, not a fill");
+    // The child authors only `height:100%` (a fill), so the explicit-height guard must NOT fire on
+    // it — hFill stays true so the generator can still emit h-full for the genuine fill child.
+    assert.equal(inner.sizing!.hFill, true, "child still fills the definite parent");
+  });
+
+  it("still detects a genuinely content-sized (auto) height as hAuto", async () => {
+    // No authored height anywhere: the box is content-sized and must stay droppable.
+    const snap = await capture(`
+      <style>.wrap { display: block; }</style>
+      <div class="wrap"><p>just some flowing text content</p></div>`);
+    const wrap = findByClass(snap.root, "wrap")!;
+    assert.ok(wrap.sizing, "wrap was probed");
+    assert.equal(wrap.sizing!.hAuto, true, "content-sized height is still auto");
+  });
+
+  it("does not treat a percentage or zero authored height as explicit", async () => {
+    // height:100% is the FILL case (handled by hFill), and height:0 is not definite; neither
+    // should trip the explicit-height override.
+    const snap = await capture(`
+      <style>
+        .pct-parent { height: 300px; }
+        .pct { height: 100%; }
+      </style>
+      <div class="pct-parent"><div class="pct"><p>x</p></div></div>`);
+    const pct = findByClass(snap.root, "pct")!;
+    assert.ok(pct.sizing, "pct was probed");
+    // A true fill child: hFill true, hAuto false — untouched by the explicit-height guard.
+    assert.equal(pct.sizing!.hFill, true, "percentage height stays a fill");
+    assert.equal(pct.sizing!.hAuto, false, "percentage fill is not content-sized");
+  });
+});

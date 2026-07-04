@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { writeText } from "../util/fsx.js";
-import type { IR, IRNode, IRChild, IRTextNode } from "../normalize/ir.js";
+import type { IR, IRNode, IRChild, IRTextNode, StyleMap } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import { generateCss, RESET_CSS } from "./css.js";
 import { generateInteractionCss } from "./interactionCss.js";
@@ -2384,17 +2384,75 @@ ${input}
 `;
 }
 
-function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: { tailwind: boolean }): (cid: string, className: string | undefined) => string | undefined {
+// Number of explicit column tracks in a computed `grid-template-columns` value. The capture
+// resolves the property to a used track list (e.g. `284px 284px 284px`), so track count is the
+// whitespace-separated token count; `none`/empty means the element is not a track grid.
+function computedTrackCount(value: string | undefined): number {
+  if (!value || value === "none") return 0;
+  return value.trim().split(/\s+/).filter(Boolean).length;
+}
+
+// Track span of a grid item from its resolved `grid-column-start`/`grid-column-end`. A spanning
+// item (`span 2`, or an explicit line pair `1 / 3`) means row-length item-counting under-reports
+// the real track count, so the column-count heuristic is not trustworthy for this container.
+function computedColumnSpan(cs: StyleMap | undefined): number {
+  if (!cs) return 1;
+  const end = cs["gridColumnEnd"];
+  const start = cs["gridColumnStart"];
+  const span = /^span\s+(\d+)$/.exec(end ?? "") ?? /^span\s+(\d+)$/.exec(start ?? "");
+  if (span) return Math.max(1, Number(span[1]));
+  if (start && end && /^-?\d+$/.test(start) && /^-?\d+$/.test(end)) {
+    const diff = Number(end) - Number(start);
+    if (Number.isFinite(diff) && diff > 1) return diff;
+  }
+  return 1;
+}
+
+export function recipeResponsiveClassCleaner(ir: IR, recipes: RecipeReport | undefined, opts: { tailwind: boolean }): (cid: string, className: string | undefined) => string | undefined {
   const recipeParents = new Set<string>();
   const repeatedGridParents = new Set<string>();
   const fillGridParents = new Set<string>();
+  // Containers whose computed geometry agreed with the item-count heuristic — a genuinely uniform
+  // repeated grid the recipe may re-flow. Row-track utilities are only stripped here; on containers
+  // where the geometry disagreed (spanning items / differing track count) the authored row and
+  // column tracks are ground truth and must survive.
+  const uniformGridParents = new Set<string>();
   const columnPlans = new Map<string, string[]>();
+  const nodeByCid = new Map<string, IRNode>();
+  const index = (n: IRNode): void => { nodeByCid.set(n.id, n); for (const c of n.children) if (!isTextChild(c)) index(c); };
+  index(ir.root);
+  // The captured/computed grid geometry is ground truth. A recipe may add semantic structure, but
+  // its column count is inferred by grouping item bounding boxes into rows — which under-reports the
+  // real track count whenever an item spans multiple columns. Before letting a recipe's synthesized
+  // column plan override the authored grid, cross-check it against the computed `grid-template-columns`
+  // track count and per-item `grid-column` spans at each regime viewport. On disagreement, keep the
+  // emitted (computed) geometry and drop the plan so spans and track count survive.
+  const planAgreesWithComputed = (c: RecipeReport["candidates"][number], regimeVps: number[]): boolean => {
+    const parent = c.itemParentCid ? nodeByCid.get(c.itemParentCid) : undefined;
+    if (!parent) return false;
+    const itemCids = (c.repeatedItems ?? []).map((i) => i.cid);
+    for (const vp of regimeVps) {
+      const tracks = computedTrackCount(parent.computedByVp[vp]?.["gridTemplateColumns"]);
+      // Only trust the heuristic where the computed grid actually is a track grid at this viewport.
+      if (tracks === 0) continue;
+      const regime = c.responsiveRegimes.find((r) => r.viewport === vp);
+      const heuristicCols = regime?.columns ?? 0;
+      if (heuristicCols > 0 && heuristicCols !== tracks) return false;
+      for (const cid of itemCids) {
+        if (computedColumnSpan(nodeByCid.get(cid)?.computedByVp[vp]) > 1) return false;
+      }
+    }
+    return true;
+  };
   const gridColumnTokens = (c: RecipeReport["candidates"][number]): string[] | null => {
     if (c.kind !== "card-grid" && c.kind !== "feature-grid" && c.kind !== "product-grid") return null;
     const regimes = c.responsiveRegimes
       .filter((r) => (r.visibleItems ?? 0) > 0 && (r.columns ?? 0) > 0)
       .sort((a, b) => a.viewport - b.viewport);
     if (regimes.length < 2) return null;
+    // The computed track geometry disagrees with the item-count heuristic (spanning items or a
+    // differing track count) — defer to the authored grid rather than synthesize a column plan.
+    if (!planAgreesWithComputed(c, regimes.map((r) => r.viewport))) return null;
     const prefixFor = (vp: number): string => vp >= 1536 ? "2xl:" : vp >= 1024 ? "lg:" : vp >= 768 ? "md:" : "";
     const tokens: string[] = [];
     let last: number | undefined;
@@ -2416,6 +2474,12 @@ function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: {
   for (const c of recipes?.candidates ?? []) {
     if ((c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid" || c.kind === "gallery-showcase" || c.kind === "logo-cloud") && c.confidence >= 0.86 && c.itemParentCid) {
       recipeParents.add(c.itemParentCid);
+      // A container is a uniform repeated grid only if its computed track geometry agrees with the
+      // item-count heuristic at every sampled regime viewport (no spanning items, matching track
+      // count). Non-grid containers (flex/stack) have no computed tracks to disagree with, so they
+      // stay eligible; a track grid whose geometry disagrees is excluded and keeps its authored rows.
+      const sampledVps = c.responsiveRegimes.map((r) => r.viewport);
+      if (planAgreesWithComputed(c, sampledVps)) uniformGridParents.add(c.itemParentCid);
       if (c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid" || c.kind === "gallery-showcase") repeatedGridParents.add(c.itemParentCid);
       if (c.kind === "card-grid" || c.kind === "feature-grid" || c.kind === "product-grid") fillGridParents.add(c.itemParentCid);
       const columns = gridColumnTokens(c);
@@ -2429,8 +2493,8 @@ function recipeResponsiveClassCleaner(recipes: RecipeReport | undefined, opts: {
     const columnPlan = opts.tailwind ? columnPlans.get(cid) : undefined;
     const keep = tokens.filter((token) => {
       if (columnPlan && /^(?:[a-z0-9-]+:)*grid-cols-(?:\d+|\[[^\]]+\])$/.test(token)) return false;
-      if (/^(?:[a-z0-9-]+:)*grid-rows-\[(?:auto_?)+\]$/.test(token)) return false;
-      if (repeatedGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\d+$/.test(token)) return false;
+      if (uniformGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\[(?:auto_?)+\]$/.test(token)) return false;
+      if (uniformGridParents.has(cid) && repeatedGridParents.has(cid) && /^(?:[a-z0-9-]+:)*grid-rows-\d+$/.test(token)) return false;
       const initialCols = /^(?:(.*):)?grid-cols-\[initial\]$/.exec(token);
       if (initialCols) {
         const prefix = initialCols[1] ? `${initialCols[1]}:` : "";
@@ -2477,7 +2541,7 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
   // CSS mode: dedup into shared semantic CSS classes. Both fidelity-neutral.
   const tw = humanize && mode === "tailwind" ? buildTailwind(ir, assetMap, input.colorVar, { interaction: input.interaction, reflow: input.reflow }) : undefined;
   const classMap = humanize && mode === "css" ? buildClassMap(ir, assetMap, input.colorVar, input.primitives, input.tokenResolver) : undefined;
-  const cleanRecipeClass = recipeResponsiveClassCleaner(input.recipeReport, { tailwind: !!tw });
+  const cleanRecipeClass = recipeResponsiveClassCleaner(ir, input.recipeReport, { tailwind: !!tw });
   const classOf = tw ? (cid: string) => cleanRecipeClass(cid, tw.classOf.get(cid)) : classMap ? (cid: string) => classMap.classOf.get(cid) : undefined;
   const styleOf = tw ? (cid: string) => tw.styleOf.get(cid) : undefined;
   // Section split (single-page humanized): plan section roots, render each into its own

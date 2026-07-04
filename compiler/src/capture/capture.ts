@@ -14,6 +14,7 @@ import {
 import { discoverBreakpoints } from "./breakpoints.js";
 import { writeJSON, writeJSONCompact, writeBytes, ensureDir } from "../util/fsx.js";
 import { sha1_12, round } from "../util/canonical.js";
+import { isZipArchive, extractDotLottieJson } from "./dotlottie.js";
 
 export const REQUIRED_VIEWPORTS = [375, 768, 1280, 1920] as const;
 // The dense width set captured for SIZE INFERENCE: a node sampled at 9 widths reveals its sizing
@@ -115,13 +116,19 @@ export function isRetryableAssetFailure(type: string, status: number | null): bo
   return status >= 500 || status === 429;
 }
 
-function extFromUrl(url: string): string {
+// Bound on a preserved file extension. Real extensions are short, but a hard 5-char cap
+// silently truncates legitimate ones (`.lottie` → `.lotti`, `.webmanifest` → `.webma`),
+// which then mis-materializes the asset. Keep the guard generous enough for the longest
+// real extensions and reject anything absurdly long (a dotted path segment, not an ext).
+const MAX_EXT_LEN = 12;
+
+export function extFromUrl(url: string): string {
   try {
     const p = new URL(url).pathname;
     const dot = p.lastIndexOf(".");
     if (dot >= 0 && dot > p.lastIndexOf("/")) {
-      const ext = p.slice(dot + 1).toLowerCase().slice(0, 5);
-      if (/^[a-z0-9]+$/.test(ext)) return ext;
+      const ext = p.slice(dot + 1).toLowerCase();
+      if (ext.length <= MAX_EXT_LEN && /^[a-z0-9]+$/.test(ext)) return ext;
     }
   } catch { /* ignore */ }
   return "";
@@ -207,6 +214,41 @@ async function settle(page: import("playwright").Page, maxMs = 2500): Promise<vo
     ]);
   } catch { /* ignore */ }
   await page.waitForTimeout(250);
+}
+
+/**
+ * Stage 2 — scroll-state reset immediately before a per-viewport snapshot. The motion /
+ * dwell-scroll / carousel / element-screenshot passes above all leave the page scrolled or
+ * mid-transition; scroll-linked styles (Webflow scroll-state transforms, position:sticky
+ * offsets) then get baked into the captured computed styles for THAT viewport only, so a
+ * scroll-driven translateY leaks into one band and cascades. Reset window + inner scrollers
+ * to the top, wait for scroll-linked effects to settle across a few rAF ticks plus a short
+ * quiescence window, THEN let the caller snapshot. Bounded and deterministic.
+ */
+async function settleScrollTopBeforeSnapshot(page: import("playwright").Page): Promise<void> {
+  try {
+    await Promise.race([
+      page.evaluate(async () => {
+        const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+        const resetAll = () => {
+          window.scrollTo(0, 0);
+          for (const el of Array.from(document.querySelectorAll("*"))) {
+            if (el.scrollLeft) el.scrollLeft = 0;
+            if (el.scrollTop) el.scrollTop = 0;
+          }
+        };
+        resetAll();
+        // Let scroll-linked effects (scroll-state classes, sticky offsets, JS scroll handlers)
+        // recompute at scroll 0 over several frames, re-asserting the top position each tick in
+        // case a handler nudged it, then hold briefly for quiescence.
+        for (let i = 0; i < 6; i++) { await raf(); resetAll(); }
+        await new Promise<void>((r) => setTimeout(r, 120));
+        resetAll();
+        await raf();
+      }),
+      new Promise<void>((r) => setTimeout(r, 4000)),
+    ]);
+  } catch { /* ignore — a best-effort reset never blocks the snapshot */ }
 }
 
 export type DismissResult = { dismissed: string[]; overlaysRemaining: number; removed: number; blocking: boolean };
@@ -579,7 +621,18 @@ export async function captureSite(opts: {
     if (type === "video" && !looksLikeVideoFile(bytes)) return;
     const a = assetMap.get(url) ?? recordAsset(url, type, null, null, "network");
     if (a.storedAs) return;
-    const ext = extFromUrl(url) || extFromContentType(a.contentType) ||
+    // A `.lottie` (dotLottie) asset is a ZIP archive, not bare lottie-web JSON. lottie-web's
+    // `path:` loader does a JSON.parse and throws on the ZIP bytes, blanking the container. So
+    // unwrap it here: extract the default animation JSON and store THAT, materializing every
+    // lottie source as plain JSON regardless of the container it arrived in.
+    let extOverride: string | null = null;
+    if (type === "lottie" && isZipArchive(bytes)) {
+      const json = extractDotLottieJson(bytes);
+      if (!json) return; // unreadable dotLottie — leave unstored rather than ship a broken ZIP
+      bytes = json;
+      extOverride = "json";
+    }
+    const ext = extOverride || extFromUrl(url) || extFromContentType(a.contentType) ||
       (type === "css" ? "css" : type === "font" ? "woff2" : type === "svg" ? "svg" :
        type === "video" ? "mp4" : type === "lottie" ? "json" : "png");
     const name = `${sha1_12(url)}.${ext}`;
@@ -972,6 +1025,12 @@ export async function captureSite(opts: {
       // Time-based reveals use the default document timeline and are untouched.
       const scrollAnimsCanceled = await neutralizeScrollTimelineAnimations(page);
       if (scrollAnimsCanceled) log({ event: "scroll_timeline_anims_canceled", viewport: vw, count: scrollAnimsCanceled });
+
+      // Final scroll-state reset immediately before the walk: every preceding pass (dwell
+      // scroll, carousel settle, element screenshots) can leave the page scrolled, which bakes
+      // scroll-linked transforms/offsets into this viewport's computed styles. Scroll to top and
+      // let scroll-linked effects settle so the snapshot records the genuine at-rest values.
+      await settleScrollTopBeforeSnapshot(page);
 
       // Bound the in-page DOM walk: page.evaluate has no default timeout, so a
       // pathologically large/animated DOM (e.g. asana.com) could hang forever.
