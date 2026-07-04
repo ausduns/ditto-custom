@@ -15,6 +15,7 @@
 import type { IR, IRNode } from "../normalize/ir.js";
 import { isTextChild } from "../normalize/ir.js";
 import type { RecipeCandidate, RecipeKind, RecipeReport } from "../infer/recipes.js";
+import { detectSectionNodes, heroLikeHeader } from "../infer/sections.js";
 import { subtreeSignature } from "../site/sharedLayout.js";
 
 export type SectionPlan = {
@@ -23,7 +24,7 @@ export type SectionPlan = {
 };
 
 const MIN_SECTION_H = 56;
-const MAX_SECTIONS = 24;
+const MAX_SECTIONS = 32;
 
 function box(n: IRNode, cw: number): { width: number; height: number } | undefined {
   return n.bboxByVp[cw] ?? Object.values(n.bboxByVp)[0];
@@ -31,14 +32,8 @@ function box(n: IRNode, cw: number): { width: number; height: number } | undefin
 function yOf(n: IRNode, cw: number): number {
   return (n.bboxByVp[cw] ?? Object.values(n.bboxByVp)[0])?.y ?? 0;
 }
-function visible(n: IRNode, cw: number): boolean {
-  return !!(n.visibleByVp[cw] ?? Object.values(n.visibleByVp)[0]);
-}
 function elementChildren(n: IRNode): IRNode[] {
   return n.children.filter((c): c is IRNode => !isTextChild(c));
-}
-function significantChildren(n: IRNode, cw: number): IRNode[] {
-  return elementChildren(n).filter((c) => visible(c, cw) && (box(c, cw)?.height ?? 0) >= MIN_SECTION_H);
 }
 
 function subtreeHasTag(n: IRNode, tag: string, depth = 4): boolean {
@@ -225,18 +220,11 @@ function recipeFallbackSections(ir: IR, recipes?: RecipeReport): { sections: IRN
 
 export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
   const cw = ir.doc.canonicalViewport;
-  // Descend through the wrapper chain (single significant child) to the container
-  // whose children are the actual sections.
-  let node = ir.root;
-  for (let i = 0; i < 10; i++) {
-    const sig = significantChildren(node, cw);
-    if (sig.length >= 2) break;
-    if (sig.length === 1) { node = sig[0]!; continue; }
-    const kids = elementChildren(node);
-    if (kids.length === 1) { node = kids[0]!; continue; }
-    break;
-  }
-  // Exclude any child that is part of a REPEATED run (≥3 same-signature siblings): that's
+  const pageH = ir.doc.perViewport[cw]?.scrollHeight ?? 0;
+  // The shared recursive band decomposition (infer/sections) — the same roots the
+  // section gate validates, so each emitted file corresponds to a gate section.
+  const bands = detectSectionNodes(ir).filter((n) => n.id !== ir.root.id);
+  // Exclude any band that is part of a REPEATED run (≥3 same-signature siblings): that's
   // a component cluster (a card/logo grid), which component extraction should turn into a
   // `.map()` over a data array — not a wall of near-identical "section" files. Only the
   // distinct, one-off blocks become sections.
@@ -246,29 +234,14 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     return list.filter((s) => (count.get(subtreeSignature(s)) ?? 0) < 3);
   };
 
-  let candidates = significantChildren(node, cw);
-  let sections = distinctOf(candidates);
-  const fallback = recipeFallbackSections(ir, recipes);
-  // If the container yields too few sections, a dominant child is a wrapper (e.g. <main>)
-  // holding the real sections — expand such oversized children into their own significant
-  // children, keeping the other siblings (e.g. a sibling <footer>). Gated on <3 so a page
-  // that already splits cleanly is untouched.
-  if (sections.length < 3) {
-    const pageH = ir.doc.perViewport[cw]?.scrollHeight ?? 0;
-    const expanded: IRNode[] = [];
-    for (const c of candidates) {
-      const inner = significantChildren(c, cw);
-      const h = box(c, cw)?.height ?? 0;
-      if (inner.length >= 3 && pageH > 0 && h >= pageH * 0.4) expanded.push(...inner);
-      else expanded.push(c);
-    }
-    candidates = expanded;
-    sections = distinctOf(candidates);
-  }
+  let sections = distinctOf(bands);
   let recipeNameHints = new Map<string, string>();
-  if (sections.length < 3 && fallback.sections.length >= 3) {
-    sections = fallback.sections;
-    recipeNameHints = fallback.names;
+  if (sections.length < 3) {
+    const fallback = recipeFallbackSections(ir, recipes);
+    if (fallback.sections.length >= 3) {
+      sections = fallback.sections;
+      recipeNameHints = fallback.names;
+    }
   }
   const roots = new Map<string, string>();
   if (sections.length < 3 || sections.length > MAX_SECTIONS) return { roots };
@@ -280,6 +253,10 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     return n === 1 ? base : `${base}${n}`;
   };
 
+  // Hero must actually start near the top of the page; without the gate a
+  // mid-page band inherits the name when the true hero was excluded (e.g. as a
+  // repeated run), which is worse than an honest content-derived name.
+  const heroMaxY = Math.max(900, pageH * 0.25);
   let heroAssigned = false;
   sections.forEach((sec, i) => {
     const isLast = i === sections.length - 1;
@@ -287,18 +264,26 @@ export function planSections(ir: IR, recipes?: RecipeReport): SectionPlan {
     let name: string;
     if (sec.tag === "footer" || (isLast && looksLikeNav(sec, cw) === false && subtreeHasTag(sec, "a") && (box(sec, cw)?.height ?? 0) < 700)) {
       name = sec.tag === "footer" ? "Footer" : (titleText(sec) ? slugWords(titleText(sec)) + "Section" : "Footer");
-    } else if (i === 0 && looksLikeNav(sec, cw)) {
+    } else if (sec.tag === "nav"
+      || (i === 0 && looksLikeNav(sec, cw) && !heroLikeHeader(sec, cw))
+      // a thin fixed bar wrapping the real <nav> (often a styled <div>, sorted after
+      // the hero it overlays) is still the navbar
+      || (yOf(sec, cw) <= 160 && (box(sec, cw)?.height ?? 0) <= 160 && subtreeHasTag(sec, "nav"))) {
       name = "Navbar";
-    } else if (sec.tag === "header") {
+    } else if (sec.tag === "header" && !heroLikeHeader(sec, cw)) {
+      // a <header> carrying the page h1 at real height is the hero, not chrome
       name = "Header";
-    } else if (!heroAssigned) {
+    } else if (!heroAssigned && yOf(sec, cw) <= heroMaxY) {
       heroAssigned = true;
       name = "HeroSection";
     } else if (recipeName) {
       name = recipeName;
     } else {
       const slug = slugWords(titleText(sec));
-      name = slug ? `${slug}Section` : `Section${i + 1}`;
+      name = slug ? `${slug}Section`
+        : subtreeHasTag(sec, "form", 6) ? "ContactSection"
+        : subtreeHasTag(sec, "video", 6) || subtreeHasTag(sec, "iframe", 6) ? "MediaSection"
+        : `Section${i + 1}`;
     }
     roots.set(sec.id, dedupe(identName(name)));
   });
