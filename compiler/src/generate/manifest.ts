@@ -18,8 +18,12 @@ export function buildManifest(args: {
   capture: CaptureResult;
   componentCount: number;
   patternHints?: PatternHints;
+  // Relative path (within generated/app) of the static preview artifact, when emitted.
+  // Lets the service/client show the cloned page from the file map BEFORE the Next build
+  // + deploy finishes, then swap to the deployed app. A fixed string — no timestamps.
+  previewHtml?: string;
 }): Record<string, unknown> {
-  const { ir, sections, tokens, assetGraph, fontGraph, capture, componentCount, patternHints } = args;
+  const { ir, sections, tokens, assetGraph, fontGraph, capture, componentCount, patternHints, previewHtml } = args;
 
   const byType: Record<string, number> = {};
   let downloaded = 0, skipped = 0;
@@ -58,6 +62,9 @@ export function buildManifest(args: {
       fallback: fontGraph.entries.filter((f) => f.status === "fallback").length,
     },
     components: { count: componentCount },
+    // Static preview artifact (runtime-free, single HTML file) the client can render
+    // immediately from the file map. Omitted when not emitted.
+    ...(previewHtml ? { preview_html: previewHtml } : {}),
     // Frozen-catalog pattern evidence (hint-only, additive): library/platform fingerprints
     // detected in the IR, with the node cids that carried each signature (bounded pre-order
     // sample). Deterministic — matches are id-sorted and cids are pre-order, so the same

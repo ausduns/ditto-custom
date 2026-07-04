@@ -111,7 +111,7 @@ export function generateAll(opts: {
   const codeQuality = buildCodeQualityReport(appDir, recipeReport);
   writeJSON(join(outDir, "code-quality.json"), codeQuality);
   writeText(join(outDir, "code-quality.md"), codeQualityReportToMarkdown(codeQuality));
-  const manifest = buildManifest({ ir, sections, tokens, assetGraph, fontGraph, capture, componentCount: inventory.count, patternHints });
+  const manifest = buildManifest({ ir, sections, tokens, assetGraph, fontGraph, capture, componentCount: inventory.count, patternHints, previewHtml: gen.previewHtml });
   writeJSON(join(outDir, "manifest.json"), manifest);
 
   return { ir, sections, tokens, assetGraph, fontGraph, recipeReport, interactionRecipeReport, patternHints, seoInventory, codeQuality, manifest, assetsCopied: mat.copied, assetsMissing: mat.missing };
