@@ -3012,24 +3012,41 @@ export function collectNodeRules(ir: IR, assetMap: Map<string, string>, includeN
         // (declsForViewport emits `visibility:hidden`; parent-equality keeps it own-only).
       } else if (ownNone || !node.visibleByVp[b.vp]) {
         const shownAtBase = node.visibleByVp[baseVp] && (node.computedByVp[baseVp]?.display || "") !== "none";
-        if (ownNone) {
-          // Own display:none removes the box from layout entirely. Emit the hide even when the node
-          // is ALSO hidden at base — a visibility:hidden base still bakes an OCCUPYING box (see
-          // above), so without this band the canonical geometry would render at this width. Skip
-          // only when the base itself is display:none (the band would be redundant).
-          if ((node.computedByVp[baseVp]?.display || "") !== "none") {
+        // Hidden by an ANCESTOR's visibility here AND at base (the ancestor's own rule carries
+        // the hide at every width) — but a visibility:hidden box still PARTICIPATES in layout,
+        // and the base rule bakes CANONICAL geometry. Same policy as the own-hidden path above:
+        // a 0x0 box gets display:none; an occupying box falls through to the per-viewport delta
+        // so it sits where the capture measured it at THIS width — not parked at e.g. a desktop
+        // left:548px inside a 375px viewport (the cropin.com/cotton slider arrow, +210px of
+        // sideways scroll at 375 with the hide inherited from an elementor-widget ancestor).
+        const ancestorHiddenHere = !ownNone && /^(hidden|collapse)$/.test(vpCs.visibility || "");
+        if (ancestorHiddenHere && !shownAtBase) {
+          const bb = node.bboxByVp[b.vp];
+          if (!bb || bb.width <= 0 || bb.height <= 0) {
             nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+            continue;
           }
-        } else if (shownAtBase) {
-          // Hidden by an ancestor (or zero-size / opacity:0): geometry overrides are breakpoint
-          // noise — the ancestor's own hide (or the reveal replay, for scroll-reveal opacity)
-          // covers it. Emit only the hide the node itself carries.
-          const hide = new Map<string, string>();
-          if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
-          if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
-          if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+          // Occupying: fall through to the normal per-viewport delta below.
+        } else {
+          if (ownNone) {
+            // Own display:none removes the box from layout entirely. Emit the hide even when the node
+            // is ALSO hidden at base — a visibility:hidden base still bakes an OCCUPYING box (see
+            // above), so without this band the canonical geometry would render at this width. Skip
+            // only when the base itself is display:none (the band would be redundant).
+            if ((node.computedByVp[baseVp]?.display || "") !== "none") {
+              nr.bands.push({ media: b.media, decls: new Map([["display", "none"]]) });
+            }
+          } else if (shownAtBase) {
+            // Hidden by an ancestor (or zero-size / opacity:0) but visible at base: geometry
+            // overrides are breakpoint noise — the ancestor's own hide (or the reveal replay,
+            // for scroll-reveal opacity) covers it. Emit only the hide the node itself carries.
+            const hide = new Map<string, string>();
+            if (pf(vpCs.opacity) === 0 && !animOwned.has("opacity")) hide.set("opacity", "0");
+            if (/^(hidden|collapse)$/.test(vpCs.visibility || "")) hide.set("visibility", "hidden");
+            if (hide.size) nr.bands.push({ media: b.media, decls: hide });
+          }
+          continue;
         }
-        continue;
       }
       const centeredVp = stableCenter || (layoutParent ? centeredAtVp(node, layoutParent, b.vp) : false);
       const vpDecls = finalizeDecls(declsForViewport(node, parentNode?.computedByVp[b.vp], b.vp, assetMap, centeredVp, colorVar, ir.doc.perViewport[b.vp]?.scrollHeight, widthPlan, gridColsByVp?.get(b.vp), gridRowsByVp?.get(b.vp), flowH, dropInsets, leftPct, heightFill, geometry, dropGridRows, dropViewportMaxWidth), tokenResolver);
