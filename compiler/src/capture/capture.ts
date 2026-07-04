@@ -217,6 +217,26 @@ export function selectVideoSourceIndex(
   return -1;
 }
 
+/**
+ * Pure decision for the per-video seek in normalizeVideoTime, extracted so the reloaded-set /
+ * seek-target branch is unit-testable in Node (the in-page loop applies the same rule to real
+ * elements). Returns the seek to perform after the re-selection reload pass, or null to fast-skip.
+ *
+ * - A `reloaded` video sits at t=0 with the HTML element's show-poster flag freshly set. Seeking to
+ *   0 would be a no-op that fires no `seeked` and leaves the poster showing, so force a genuine seek
+ *   to a tiny epsilon to clear the flag and paint the new source's frame 0.
+ * - A non-reloaded video already at t≈0 needs nothing (skip). Otherwise seek it back to 0.
+ */
+export function planVideoSeek(
+  reloaded: boolean,
+  currentTime: number,
+): { target: number } | null {
+  const EPSILON = 1e-4;
+  if (reloaded) return { target: EPSILON };
+  if (Math.abs(currentTime) < 1e-3) return null;
+  return { target: 0 };
+}
+
 async function autoScroll(page: import("playwright").Page, vpHeight: number): Promise<void> {
   // Scroll through the page to trigger lazy-loaded images/backgrounds, then return
   // to the top so document-coordinate bboxes are measured from a settled layout.
@@ -850,9 +870,12 @@ async function captureScreenshot(
  * and — the common case — a no-op whenever the current selection is still the right one, so the fast
  * path never touches `video.load()`.
  */
-export async function normalizeVideoTime(page: import("playwright").Page): Promise<void> {
+export async function normalizeVideoTime(
+  page: import("playwright").Page,
+  log?: (event: Record<string, unknown>) => void,
+): Promise<void> {
   try {
-    await page.evaluate(async () => {
+    const reselections = await page.evaluate(async () => {
       const vids = Array.from(document.querySelectorAll("video"));
       const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 
@@ -861,6 +884,17 @@ export async function normalizeVideoTime(page: import("playwright").Page): Promi
       // whose media matches (missing media matches unconditionally) and whose type is playable
       // (missing type is never disqualifying). Only reload when the winner differs from what is
       // currently loaded — the fast path leaves untouched videos alone.
+      //
+      // Track which videos we reloaded. A reload resets the element's *show-poster flag* to true and
+      // sets currentTime to 0; the follow-up pause() cancels the pending autoplay, so the one thing
+      // that would have cleared that flag (playback beginning) never happens. Left uncleared, the
+      // element renders its `poster` image — which for an aspect-gated hero is a frame of the WRONG
+      // variant — instead of the freshly-selected source's frame 0. A real seek is the other
+      // flag-clearing path, but the fast-skip below bails at t=0. So force a genuine seek (to a tiny
+      // epsilon, not to the already-current 0) on exactly the reloaded videos to clear the flag and
+      // present the new source's decoded frame. Non-reloaded videos keep the existing fast skip.
+      const reloaded = new WeakSet<HTMLVideoElement>();
+      const reselections: { from: string; to: string; readyState: number }[] = [];
       const reloadWaits: Promise<void>[] = [];
       for (const v of vids) {
         try {
@@ -878,34 +912,66 @@ export async function normalizeVideoTime(page: import("playwright").Page): Promi
           if (!winner || !winner.src) continue;
           // Compare resolved URLs; currentSrc is absolute, winner.src is already resolved.
           if (v.currentSrc === winner.src) continue; // no change — fast path, do not reload
+          const from = v.currentSrc;
+          const to = winner.src;
           v.load();
+          reloaded.add(v);
           reloadWaits.push(new Promise<void>((resolve) => {
             let settled = false;
-            const done = () => { if (settled) return; settled = true; v.removeEventListener("loadeddata", done); resolve(); };
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              v.removeEventListener("loadeddata", done);
+              v.removeEventListener("seeked", done);
+              reselections.push({ from, to, readyState: v.readyState });
+              resolve();
+            };
             if (v.readyState >= 2 /* HAVE_CURRENT_DATA */) { done(); return; }
+            // A post-reload `seeked` implies a decoded frame is ready too, so treat it as an
+            // additional readiness signal: on slow CDNs the epsilon seek (below) can land its
+            // `seeked` before `loadeddata`, which unblocks the FIRST viewport instead of waiting
+            // out the 4s bound and shooting the poster.
             v.addEventListener("loadeddata", done, { once: true });
+            v.addEventListener("seeked", done, { once: true });
             setTimeout(done, 4000); // bound: a stalled reload resolves anyway so the shot never hangs
           }));
         } catch { /* a malformed <source>/media query must not block the others */ }
       }
-      if (reloadWaits.length) await Promise.all(reloadWaits);
 
       const waits: Promise<void>[] = [];
-      for (const v of vids) {
-        try { v.pause(); } catch { /* ignore */ }
-        // Seek to 0 only when not already there (a fresh seek to the current time may not fire `seeked`).
-        if (Math.abs(v.currentTime) < 1e-3) continue;
-        waits.push(new Promise<void>((resolve) => {
+      const seekTo = (v: HTMLVideoElement, t: number) =>
+        new Promise<void>((resolve) => {
           let settled = false;
           const done = () => { if (settled) return; settled = true; v.removeEventListener("seeked", done); resolve(); };
           v.addEventListener("seeked", done, { once: true });
-          try { v.currentTime = 0; } catch { done(); }
+          try { v.currentTime = t; } catch { done(); }
           setTimeout(done, 400); // bound: a stalled/unseekable video resolves anyway
-        }));
+        });
+      for (const v of vids) {
+        try { v.pause(); } catch { /* ignore */ }
+        if (reloaded.has(v)) {
+          // A just-reloaded video sits at t=0 with the show-poster flag set. Seek to a tiny epsilon
+          // (not 0, which is already the current time and would fire no `seeked`) to force a genuine
+          // seek: it clears the flag and paints the new source's frame 0. Start it eagerly so its
+          // `seeked` can also satisfy the reload wait above on slow networks.
+          waits.push(seekTo(v, 1e-4));
+          continue;
+        }
+        // Seek to 0 only when not already there (a fresh seek to the current time may not fire `seeked`).
+        if (Math.abs(v.currentTime) < 1e-3) continue;
+        waits.push(seekTo(v, 0));
       }
-      await Promise.all(waits);
+      // Await the reload settles and the seeks together; the reload wait can be released by an
+      // epsilon seek's `seeked`, so both sets must be in flight before we block on either.
+      await Promise.all([...reloadWaits, ...waits]);
       await raf(); await raf(); // let the decoded frame composite before the screenshot reads pixels
+      return reselections;
     });
+    if (log && reselections && reselections.length) {
+      for (const r of reselections) {
+        log({ event: "video_source_reselected", from: r.from, to: r.to, readyState: r.readyState });
+      }
+    }
   } catch { /* a page with no videos / an eval hiccup must never block the screenshot */ }
 }
 
@@ -1502,7 +1568,7 @@ export async function captureSite(opts: {
         // Normalize every video to frame 0 (paused) at THIS viewport before the shot — the clone is
         // always at frame 0, so pinning the source there too makes the two channels comparable
         // regardless of the playback time the viewport happened to catch.
-        await normalizeVideoTime(page);
+        await normalizeVideoTime(page, log);
         await captureScreenshot(page, join(screenshotsDir, `${vw}.png`), vw, log);
       }
 
