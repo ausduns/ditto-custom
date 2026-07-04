@@ -304,6 +304,10 @@ export function buildIR(sourceDir: string, viewports: number[], opts?: { motion?
   const convert = (raw: RawNode, matched: Record<number, RawNode | undefined>): IRNode | null => {
     if (NOISE_TAGS.has(raw.tag)) return null;
     if (isThirdPartyOverlay(raw)) return null;
+    // Font-metric / measurement scratch nodes the source's own JS injects (tagged by the walker):
+    // absolutely positioned, parked far off-screen, non-painting. Never user-visible — drop so they
+    // don't ship as page markup (e.g. the `<div … -top-[6249rem] invisible>Mgy</div>` probe).
+    if (raw.probe) return null;
 
     const visibleByVp: Record<number, boolean> = {};
     const bboxByVp: Record<number, BBox> = {};

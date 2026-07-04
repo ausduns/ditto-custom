@@ -28,6 +28,25 @@ import type { InteractionCapture, StyleDelta } from "../capture/interactions.js"
 function arb(v: string): string {
   return v.replace(/"/g, "'").replace(/_/g, "\\_").replace(/ /g, "_");
 }
+
+/** Round a single simple `<number>px|rem` length, killing frozen sub-pixel noise: snap to an
+ *  integer when the value is within 0.1px of one (measurement/rounding jitter — `204.9994px` was
+ *  meant to be `205px`), otherwise keep at most 1 decimal (`204.797px` → `204.8px`, a genuine
+ *  fraction). `627px` is unchanged. Only touches a lone number+unit token: multi-token values,
+ *  calc()/clamp()/var(), percentages, and unitless numbers pass through untouched, so nothing that
+ *  needs exact sub-pixel precision (borders, transforms — handled on their own branches) is moved. */
+export function snapLen(value: string): string {
+  const m = /^(-?\d*\.?\d+)(px|rem)$/.exec(value.trim());
+  if (!m) return value;
+  const n = parseFloat(m[1]!);
+  const unit = m[2]!;
+  // rem thresholds scale by the 16px root so "within 0.1px" is unit-consistent.
+  const pxPerUnit = unit === "rem" ? 16 : 1;
+  const rounded = Math.abs(n - Math.round(n)) * pxPerUnit < 0.1
+    ? Math.round(n)
+    : Math.round(n * 10) / 10;
+  return `${rounded}${unit}`;
+}
 function arbList(v: string): string {
   return arb(v).replace(/,_/g, ",");
 }
@@ -243,7 +262,7 @@ export function declToUtil(prop: string, value: string): string {
     if (value === "0" || value === "0px" || value === "0rem") {
       return ZERO_NAMED.has(prop) ? `${ARB[prop]}-0` : `${ARB[prop]}-[0px]`;
     }
-    return `${ARB[prop]}-[${arb(value)}]`;
+    return `${ARB[prop]}-[${arb(snapLen(value))}]`;
   }
   if (/^border-(top|right|bottom|left)-width$/.test(prop)) {
     const side = prop.split("-")[1]![0]!; // t/r/b/l

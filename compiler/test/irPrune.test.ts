@@ -98,3 +98,21 @@ describe("IR prune keeps <source> media candidates", () => {
     assert.equal(findByTag(root, "picture"), null);
   });
 });
+
+describe("IR drops font-metric probe nodes (fix 4)", () => {
+  it("excludes a walker-tagged probe node from the IR, keeping its siblings", () => {
+    const probe: RawNode = {
+      ...raw("div", { class: "font-probe" }, [{ text: "Mgy" }]),
+      probe: true,
+    };
+    const real = raw("h1", { class: "title" }, [{ text: "Heading" }]);
+    const body = raw("body", {}, [real, probe]);
+
+    const root = buildFixtureIR(body);
+
+    const kept = root.children.filter((c) => !isTextChild(c)).map((c) => (c as IRNode).tag);
+    assert.deepEqual(kept, ["h1"], "probe div is dropped, the real heading survives");
+    // Its text must not leak into the tree either.
+    assert.equal(findByTag(root, "div"), null);
+  });
+});

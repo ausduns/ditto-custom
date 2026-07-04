@@ -44,6 +44,10 @@ export type RawNode = {
   computed: RawStyle;
   bbox: RawBBox;
   visible: boolean;
+  // A font-metric / measurement scratch node injected by the SOURCE site's own JS (typography
+  // libraries, FontFaceObserver): absolutely positioned, parked far off-screen, and non-painting.
+  // Never user-visible; excluded from emission so it doesn't ship as page markup.
+  probe?: boolean;
   sizing?: RawSizing;
   before?: RawStyle;
   after?: RawStyle;
@@ -286,6 +290,23 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
     return true;
   };
 
+  // A measurement/probe scratch node: out-of-flow (absolute/fixed), parked far off-screen
+  // (≥10000px beyond any edge — real drawers/sr-only content never live out there), AND
+  // non-painting (visibility:hidden / collapse / opacity:0). The two together are exclusive to
+  // font-metric / measurement scratch elements the source's own JS injects (a11y sr-only text
+  // stays visibility:visible so AT can read it, so it never matches). Tagged so emission drops it.
+  const OFFSCREEN_PROBE_PX = 10000;
+  const isProbe = (cs: CSSStyleDeclaration, bbox: RawBBox): boolean => {
+    if (cs.position !== "absolute" && cs.position !== "fixed") return false;
+    const nonPainting = cs.visibility === "hidden" || cs.visibility === "collapse" || parseFloat(cs.opacity || "1") === 0;
+    if (!nonPainting) return false;
+    const rightEdge = bbox.x + bbox.width;
+    const bottomEdge = bbox.y + bbox.height;
+    const pageH = round2(scrollEl.scrollHeight);
+    return rightEdge <= -OFFSCREEN_PROBE_PX || bottomEdge <= -OFFSCREEN_PROBE_PX
+      || bbox.x >= OFFSCREEN_PROBE_PX + vpW || bbox.y >= OFFSCREEN_PROBE_PX + pageH;
+  };
+
   const serializeElement = (el: Element): RawNode | null => {
     if (nodeCount >= MAX_NODES) { truncated = true; return null; }
     const tag = el.tagName.toLowerCase();
@@ -401,6 +422,7 @@ export function collectPage(opts?: { maxNodes?: number } | void): PageSnapshot {
       computed,
       bbox,
       visible: isVisible(el, cs, bbox),
+      ...(isProbe(cs, bbox) ? { probe: true } : {}),
       ...(sizing ? { sizing } : {}),
       children: [],
     };

@@ -17,7 +17,7 @@ import { buildClassMap } from "./classMap.js";
 import { buildTailwind, tailwindGlobalsCss } from "./tailwind.js";
 import { planSections, type SectionPlan } from "./sectionSplit.js";
 import type { RecipeReport } from "../infer/recipes.js";
-import { emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, viewportExport, type SeoInventory } from "./seo.js";
+import { emitSeoAssetFiles, emitSeoRoutes, jsonLdHeadMarkup, metadataExport, routeSummaryFromIr, seoStaticFiles, siteOriginImportLine, SITE_ORIGIN_LAYOUT_IMPORT, SITE_ORIGIN_MODULE, viewportExport, type SeoInventory } from "./seo.js";
 import { emitGeneratedDocs } from "./docs.js";
 
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
@@ -280,6 +280,17 @@ export function renderAttrs(pairs: Array<[string, string]>): string {
 function jsxText(raw: string): string {
   if (raw.length > 0 && raw === raw.trim() && !/\s{2,}/.test(raw) && !/[{}<>&\n\r\t]/.test(raw)) return raw;
   return `{${escapeText(raw)}}`;
+}
+
+/** Collapse a text run under `white-space: normal` the way CSS renders it: every run of
+ *  whitespace (captured \n\t indentation, doubled spaces) becomes a single space, so the
+ *  markup carries content — not the source file's frozen formatting. Leading/trailing single
+ *  spaces are KEPT (JSX-significant for inline flow); the boundary is preserved so `word <b>x</b>`
+ *  keeps its space. A run that is entirely whitespace collapses to a single space. The text gate
+ *  compares whitespace-normalized (gates.ts:normText), so this stays faithful. */
+function collapseWs(raw: string): string {
+  const collapsed = raw.replace(/\s+/g, " ");
+  return collapsed;
 }
 
 /** The ordered [propKey, valueExpr] list a node emits — rendered to clean JSX attributes
@@ -591,7 +602,7 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
     return `${pad}<${tag}${attrs} />`;
   }
 
-  const childParts = emitChildren(node.children, tag, assetMap, sourceUrl, indent + 1, childInteractive, ctx, childTable);
+  const childParts = emitChildren(node.children, tag, assetMap, sourceUrl, indent + 1, childInteractive, ctx, childTable, preservesWhitespace(node));
   if (childParts.length === 0) {
     return `${pad}<${tag}${attrs} />`;
   }
@@ -602,7 +613,7 @@ function renderNode(node: IRNode, assetMap: Map<string, string>, sourceUrl: stri
  *  `{Name_data.map(...)}` call for any run of extracted-component instances. Shared
  *  by renderNode (parentTag is the element tag) and the body/chrome fragment
  *  renderers (parentTag null → no element-only-parent whitespace rule). */
-function emitChildren(children: IRChild[], parentTag: string | null, assetMap: Map<string, string>, sourceUrl: string, indent: number, childInteractive: boolean, ctx?: RenderCtx, insideTable = false): string[] {
+function emitChildren(children: IRChild[], parentTag: string | null, assetMap: Map<string, string>, sourceUrl: string, indent: number, childInteractive: boolean, ctx?: RenderCtx, insideTable = false, preserveWs = false): string[] {
   const pad = "  ".repeat(indent);
   const parts: string[] = [];
   // Coalesce consecutive text children into one. Emitting them as separate JSX
@@ -612,7 +623,12 @@ function emitChildren(children: IRChild[], parentTag: string | null, assetMap: M
   let textBuf = "";
   const flushText = () => {
     if (parentTag && ELEMENT_ONLY_PARENTS.has(parentTag) && textBuf.trim() === "") { textBuf = ""; return; }
-    if (textBuf.length) parts.push(`${pad}${jsxText(textBuf)}`);
+    // Under white-space:normal, collapse the captured formatting (\n\t runs, doubled/leading
+    // multi-space) to CSS-equivalent single spaces so markup ships content, not source-file
+    // indentation. A whitespace-only run collapses to a single significant space ({" "}) — the
+    // huge `{"          "}` literals disappear. Preserve verbatim under pre/pre-wrap/pre-line.
+    const out = preserveWs ? textBuf : collapseWs(textBuf);
+    if (out.length) parts.push(`${pad}${jsxText(out)}`);
     textBuf = "";
   };
   const reg = ctx?.components;
@@ -708,12 +724,20 @@ function takeCid(coll: CidCollector, instances: IRNode[]): number {
   return idx;
 }
 
-/** A self-contained class-name merger emitted into each component module that needs it
- *  (kept import-free so component files stay standalone). Skips falsy parts and joins —
- *  exact for our output because a node's baked base classes and its per-instance overrides
- *  are disjoint token sets. Swap in `tailwind-merge` if you want conflict-aware merging
- *  when hand-editing the ./_styles overrides. */
-const CN_HELPER = `function cn(...parts: Array<string | false | null | undefined>) {\n  return parts.filter(Boolean).join(" ");\n}`;
+/** The single shared `cn()` module (`src/lib/utils.ts`), imported by every module that
+ *  merges class names — one definition per clone instead of a copy per component file.
+ *  Skips falsy parts and joins — exact for our output because a node's baked base classes
+ *  and its per-instance overrides are disjoint token sets. Swap in `tailwind-merge` if you
+ *  want conflict-aware merging when hand-editing the ./_styles overrides. */
+export const CN_UTILS_MODULE = `export function cn(...parts: Array<string | false | null | undefined>) {\n  return parts.filter(Boolean).join(" ");\n}\n`;
+
+/** The `import { cn } from "…/lib/utils"` line a module emits when it references `cn(`.
+ *  `depth` is how many directory levels the consuming file sits BELOW `src` (page.tsx in
+ *  `src/app` → 1; a component in `src/app/components` → 2), so the relative path always
+ *  resolves to the single `src/lib/utils`. */
+export function cnImportLine(depth: number): string {
+  return `import { cn } from "${"../".repeat(Math.max(1, depth))}lib/utils";`;
+}
 
 /** Split a className value SOURCE (a JSON string literal as emitted by propsList) into its
  *  whitespace-separated tokens. Returns [] for a non-string / unparseable source. */
@@ -850,6 +874,15 @@ function canonicalViewportFor(n: IRNode): number {
   if (n.computedByVp[1280] || n.visibleByVp[1280] !== undefined) return 1280;
   const keys = Object.keys(n.computedByVp).map(Number).filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
   return keys[0] ?? 1280;
+}
+
+/** Whether a node's `white-space` preserves captured whitespace verbatim (pre/pre-wrap/pre-line/
+ *  break-spaces) — in which case emission must NOT collapse its text runs. `<pre>`/`<textarea>`
+ *  default to pre even without an explicit declaration. Normal/nowrap collapse per CSS. */
+function preservesWhitespace(n: IRNode): boolean {
+  const ws = (n.computedByVp[canonicalViewportFor(n)] ?? Object.values(n.computedByVp)[0])?.whiteSpace;
+  if (ws) return /^(pre|pre-wrap|pre-line|break-spaces)$/.test(ws);
+  return n.tag === "pre" || n.tag === "textarea";
 }
 
 type TextLeaf = { text: string; node: IRNode; index: number; ancestorTags: string[] };
@@ -1594,7 +1627,8 @@ export function componentPreamble(reg: ComponentRegistry | undefined): string {
   const cids = reg.cidDecls.map((c) => `const ${c.varName}: string[][] = ${c.body};`);
   const styles = reg.styleDecls.map((s) => `const ${s.varName} = ${s.body};`);
   const fns = [...reg.funcDefs.values()];
-  const cn = fns.some((f) => f.includes("cn(")) ? [CN_HELPER] : [];
+  // Inlined into a chrome module at src/app (layout.tsx) or src/ (Chrome.tsx) — depth 1.
+  const cn = fns.some((f) => f.includes("cn(")) ? [cnImportLine(1)] : [];
   const parts = [...cn, ...fns, ...data, ...cids, ...styles];
   return parts.length ? parts.join("\n\n") : "";
 }
@@ -1818,13 +1852,13 @@ function describeComponent(name: string): string {
   return map[base] ?? `${base.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()} component.`;
 }
 
-export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgRegistry): Array<{ name: string; module: string }> {
+export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgRegistry, depth = 2): Array<{ name: string; module: string }> {
   if (!reg || reg.funcDefs.size === 0) return [];
   return [...reg.funcDefs].map(([name, src]) => {
     const agg = reg.byName.get(name);
     void agg;
     const header = `/** ${describeComponent(name)} */`;
-    const cnDef = src.includes("cn(") ? CN_HELPER + "\n" : "";
+    const cnImport = src.includes("cn(") ? cnImportLine(depth) : "";
     // The component's props-data type is DEFINED here (colocated), not imported from a central content
     // file — and exported so the section that supplies the data can type its array. Per-instance class
     // overrides still come from _styles.ts (pure styling plumbing).
@@ -1842,9 +1876,9 @@ export function componentFiles(reg: ComponentRegistry | undefined, svgs?: SvgReg
     for (const c of scanRefs(src).comps) {
       if (svgs?.defs.has(c)) svgImports.push(`import ${c} from "../svgs/${svgFileBase(c)}";`);
     }
-    const imports = [...typeImports, ...svgImports];
+    const imports = [...typeImports, ...svgImports, ...(cnImport ? [cnImport] : [])];
     const importBlock = imports.length ? imports.join("\n") + "\n" : "";
-    return { name, module: `${importBlock}${typeDef}${header}\n${cnDef}export default ${src}\n` };
+    return { name, module: `${importBlock}${typeDef}${header}\nexport default ${src}\n` };
   });
 }
 
@@ -2082,6 +2116,7 @@ export function sectionFiles(sreg: SectionRegistry | undefined, reg: ComponentRe
     ];
     const params = paramParts.length ? `{ ${paramParts.join(", ")} } = {}` : "";
     const header = `/** ${describeSection(name)} */`;
+    if (/\bcn\(/.test(body)) lines.push(cnImportLine(2)); // sections live at src/app/sections
     const importBlock = lines.length ? lines.join("\n") + "\n" : "";
     const allConsts = consts;
     const constBlock = allConsts.length ? allConsts.join("\n") + "\n" : "";
@@ -2121,6 +2156,7 @@ export function generatePageTsx(ir: IR, assetMap: Map<string, string>, sourceUrl
     hasMotion ? `import DittoMotion from "${dittoMotionImportPath(0)}";` : "",
     hasLottie ? `import DittoLottie from "${dittoLottieImportPath(0)}";` : "",
     hasMenus ? `import DropdownMenu from "${dropdownMenuImportPath(0)}";` : "",
+    /\bcn\(/.test(body) ? cnImportLine(1) : "", // page.tsx lives at src/app
     ...compImports,
   ].filter(Boolean).join("\n");
   const importBlock = imports ? imports + "\n\n" : "";
@@ -2137,31 +2173,33 @@ ${body}${wiresBlock}${accordionBlock}${motionBlock}${lottieBlock}${menusBlock}
 /** SEO scaffolding (Next App Router): robots.ts + sitemap.ts + an llms.txt route, generated
  *  from the captured URL / title / description — the discovery files a real site ships. */
 function seoFiles(ir: IR): Array<[string, string]> {
-  let origin = "https://example.com";
-  try { origin = new URL(ir.doc.sourceUrl).origin; } catch { /* keep default */ }
-  const url = ir.doc.sourceUrl || origin + "/";
   const title = ir.doc.title || "Home";
   const desc = ir.doc.head?.description || "";
+  // robots.ts / sitemap.ts live at src/app → depth 1 below src. URLs resolve against the
+  // clone's own origin (SITE_ORIGIN, relative by default), never the source domain.
+  const siteImport = siteOriginImportLine(1);
   const robots = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: { userAgent: "*", allow: "/" },
-    sitemap: ${JSON.stringify(origin + "/sitemap.xml")},
+    sitemap: SITE_ORIGIN + "/sitemap.xml",
   };
 }
 `;
   const sitemap = `import type { MetadataRoute } from "next";
+${siteImport}
 
 export const dynamic = "force-static";
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [{ url: ${JSON.stringify(url)}, changeFrequency: "weekly", priority: 1 }];
+  return [{ url: SITE_ORIGIN + "/", changeFrequency: "weekly", priority: 1 }];
 }
 `;
-  const llmsText = [`# ${title}`, ...(desc ? ["", `> ${desc}`] : []), "", "## Pages", "", `- [${title}](${url})`, ""].join("\n");
+  const llmsText = [`# ${title}`, ...(desc ? ["", `> ${desc}`] : []), "", "## Pages", "", `- [${title}](/)`, ""].join("\n");
   const llms = `export const dynamic = "force-static";
 
 export function GET() {
@@ -2183,10 +2221,11 @@ function generateLayoutTsx(ir: IR, bodyClass?: string, seo?: SeoInventory): stri
   const viewport = seo ? viewportExport(seo) : `export const viewport = { width: "device-width", initialScale: 1 };\n`;
   const jsonLd = seo ? jsonLdHeadMarkup(seo, 8) : "";
   const head = jsonLd ? `      <head>\n${jsonLd}\n      </head>\n` : "";
+  const siteImport = seo ? SITE_ORIGIN_LAYOUT_IMPORT + "\n" : "";
   return `import "./globals.css";
 import "./ditto.css";
 import type { ReactNode } from "react";
-
+${siteImport}
 ${metadata}${viewport}
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -2541,6 +2580,9 @@ export function generateApp(input: GenerateInput, tokensCss: string): { pageTsx:
     writeText(join(rootDir, "globals.css"), framework === "vite" ? viteGlobalsCss(globals) : globals);
   }
   writeText(join(rootDir, "ditto.css"), cloneCss);
+  writeText(join(appDir, "src", "lib", "utils.ts"), CN_UTILS_MODULE);
+  // SITE_ORIGIN constant for SEO/metadata routes (Next only — Vite ships static SEO files).
+  if (framework === "next") writeText(join(appDir, "src", "lib", "site.ts"), SITE_ORIGIN_MODULE);
   if (wires.length) writeText(join(rootDir, "ditto", "DittoWire.tsx"), DITTO_WIRE_TSX);
   if (accordions.length) writeText(join(rootDir, "ditto", "Accordion.tsx"), ACCORDION_TSX);
   if (motionHasContent(motionSpec)) writeText(join(rootDir, "ditto", "DittoMotion.tsx"), DITTO_MOTION_TSX);

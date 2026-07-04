@@ -158,3 +158,56 @@ describe("walker off-screen visibility", () => {
     assert.equal(fixed.visible, false, "fixed box below the viewport is invisible");
   });
 });
+
+describe("walker font-metric probe tagging (fix 4)", () => {
+  let browser: Browser;
+  let page: Page;
+  before(async () => {
+    browser = await chromium.launch();
+    page = await browser.newPage();
+    await page.setViewportSize({ width: 375, height: 768 });
+  });
+  after(async () => {
+    await browser.close();
+  });
+
+  const capture = async (html: string) => {
+    await page.setContent(html);
+    await page.evaluate("globalThis.__name = globalThis.__name || ((fn) => fn);");
+    return page.evaluate(collectPage);
+  };
+
+  it("tags a far-off-screen, non-painting measurement scratch node as a probe", async () => {
+    // The classic font-metric probe pattern (WordPress/typography libs): absolutely positioned,
+    // parked ~100000px off-screen, visibility:hidden, holding measurement text.
+    const snap = await capture(`
+      <p class="real">Real content</p>
+      <div class="probe" style="position:absolute;top:-99999px;left:-99999px;
+           visibility:hidden;white-space:nowrap;">Mgy</div>`);
+    const probe = findByClass(snap.root, "probe")!;
+    assert.equal(probe.probe, true, "far-off-screen hidden scratch node is a probe");
+    const real = findByClass(snap.root, "real")!;
+    assert.ok(!real.probe, "real content is not a probe");
+  });
+
+  it("does NOT tag a near-off-screen hidden drawer (real content) as a probe", async () => {
+    // A slide-in drawer parked just off the left edge (x:-375, visibility:hidden) is real
+    // content that a controller can reveal — it must NOT be mistaken for a measurement probe.
+    const snap = await capture(`
+      <div class="drawer" style="position:fixed;left:0;top:0;width:375px;height:768px;
+           transform:translateX(-100%);visibility:hidden;">
+        <h2 class="dtitle">Menu</h2>
+      </div>`);
+    const drawer = findByClass(snap.root, "drawer")!;
+    assert.ok(!drawer.probe, "a near-off-screen drawer is not a probe");
+  });
+
+  it("does NOT tag an sr-only (visible, on-screen-adjacent) accessibility label as a probe", async () => {
+    // Screen-reader-only text stays visibility:visible so AT can read it; even parked far off
+    // via left:-9999px it must survive (and 9999px is under the 10000px probe threshold anyway).
+    const snap = await capture(`
+      <a href="/"><span class="sr" style="position:absolute;left:-9999px;">Skip to content</span>Home</a>`);
+    const sr = findByClass(snap.root, "sr")!;
+    assert.ok(!sr.probe, "sr-only accessible text is not a probe");
+  });
+});

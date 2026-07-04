@@ -298,7 +298,10 @@ export type WidthPlan = { kind: "fixed" } | { kind: "auto" } | { kind: "percent"
 const PLAN_FIXED: WidthPlan = { kind: "fixed" };
 
 const pf = (v: string | undefined): number => { const n = parseFloat(v ?? ""); return Number.isFinite(n) ? n : 0; };
-const fmtPx = (n: number): string => `${Math.round(n * 1000) / 1000}px`;
+// Snap sub-pixel geometry: integer when within 0.1px (measurement jitter), else at most 1 decimal
+// — matching the Tailwind arbitrary-length rounding (tailwind.ts:snapLen) so CSS and utility output
+// agree and frozen sub-pixel noise (204.797px) never ships. Transforms/border widths format elsewhere.
+const fmtPx = (n: number): string => `${(Math.abs(n - Math.round(n)) < 0.1 ? Math.round(n) : Math.round(n * 10) / 10)}px`;
 const viewportHeightFor = (vp: number): number => CAPTURE_VIEWPORT_HEIGHTS[vp] ?? Math.round(vp * 0.66);
 
 type GeometryPlan = {
